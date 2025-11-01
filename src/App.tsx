@@ -133,7 +133,7 @@ async function parseUsersExcel(file: File): Promise<User[]> {
   const users: User[] = rows
     .map((r, i) => {
       const codeRaw = r[codeKey] ?? `U${i + 1}`;
-      const code = normCode(codeRaw);
+      const code = normCode(String(codeRaw));
       const name = String(r[nameKey] ?? r[codeKey] ?? `U${i + 1}`).trim();
       const w = ratioKey ? Number(r[ratioKey]) : 100;
       const onlineVal = onKey != null ? String(r[onKey]).trim() : "true";
@@ -202,14 +202,15 @@ function sortRowsByGroupKeys(rows: TaskRow[], keys: string[]) {
   const sorted = rows.slice().map((r, i) => ({ ...r, __idx__: i }));
   sorted.sort((a, b) => {
     for (const k of keys) {
-      const av = String(a[k] ?? "");
-      const bv = String(b[k] ?? "");
+      const av = String((a as Record<string, unknown>)[k] ?? "");
+      const bv = String((b as Record<string, unknown>)[k] ?? "");
       if (av < bv) return -1;
       if (av > bv) return 1;
     }
     return a.__idx__ - b.__idx__;
   });
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   return sorted.map(({ __idx__, ...rest }) => rest);
 }
 
@@ -311,8 +312,9 @@ function exportExcelWithAssignments(
 
   const finalHeaders = ["ma_nv_phan_cong", "ten_nv_phan_cong", ...taskHeaders];
   const rowsForSheet = merged.map((r) => {
-    const o: Record<string, any> = {};
-    for (const h of finalHeaders) o[h] = (r as any)[h] ?? "";
+    const o: Record<string, unknown> = {};
+    for (const h of finalHeaders)
+      o[h] = (r as Record<string, unknown>)[h] ?? "";
     return o;
   });
 
@@ -351,7 +353,7 @@ function exportSortedTasksExcel(taskRows: TaskRow[], taskHeaders: string[]) {
     ? taskHeaders
     : Object.keys(taskRows[0] || {});
   const rowsForSheet = taskRows.map((r) => {
-    const o: Record<string, any> = {};
+    const o: Record<string, unknown> = {};
     for (const h of finalHeaders) o[h] = r[h] ?? "";
     return o;
   });
@@ -439,8 +441,9 @@ export default function App() {
     try {
       const data = await listUsers(true);
       setUsers(data);
-    } catch (e: any) {
-      message.error(`Lỗi tải users từ Firestore: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lỗi tải users từ Firestore: ${error?.message || e}`);
     } finally {
       setLoadingUsers(false);
     }
@@ -497,8 +500,11 @@ export default function App() {
                 try {
                   await updateUserWeight(u.code, v);
                   message.success("Đã cập nhật tỉ lệ.");
-                } catch (e: any) {
-                  message.error(`Cập nhật tỉ lệ thất bại: ${e?.message || e}`);
+                } catch (e: unknown) {
+                  const error = e as Error;
+                  message.error(
+                    `Cập nhật tỉ lệ thất bại: ${error?.message || e}`
+                  );
                 }
               }}
             >
@@ -527,7 +533,7 @@ export default function App() {
       dataIndex: "name",
       key: "name",
       width: 240,
-      render: (text, u) => (
+      render: (_text, u) => (
         <Space size={8}>
           <Badge status={u.online ? "success" : "default"} dot>
             <Avatar size="small" icon={<UserOutlined />}>
@@ -561,8 +567,9 @@ export default function App() {
             );
             try {
               await updateUserOnline(u.code, checked);
-            } catch (e: any) {
-              message.error(`Cập nhật online thất bại: ${e?.message || e}`);
+            } catch (e: unknown) {
+              const error = e as Error;
+              message.error(`Cập nhật online thất bại: ${error?.message || e}`);
               setUsers((prev) =>
                 prev.map((x) =>
                   x.code === u.code ? { ...x, online: !checked } : x
@@ -648,8 +655,9 @@ export default function App() {
                 await deleteUser(u.code);
                 message.success(`Đã xóa ${u.code}`);
                 reloadUsers();
-              } catch (e: any) {
-                message.error(`Xóa thất bại: ${e?.message || e}`);
+              } catch (e: unknown) {
+                const error = e as Error;
+                message.error(`Xóa thất bại: ${error?.message || e}`);
               }
             }}
           >
@@ -726,8 +734,9 @@ export default function App() {
       await upsertUsersBulk(parsed);
       await reloadUsers();
       message.success(`Đã nạp ${parsed.length} nhân viên vào Firestore.`);
-    } catch (e: any) {
-      message.error(`Lỗi import: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lỗi import: ${error?.message || e}`);
     }
     return Upload.LIST_IGNORE;
   };
@@ -744,8 +753,9 @@ export default function App() {
       setTaskRows(sortedRows);
       setTaskHeaders(headers);
       message.success(`Đã nạp & sắp xếp ${sortedRows.length} dòng công việc.`);
-    } catch (e: any) {
-      message.error(`Lỗi đọc file công việc: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lỗi đọc file công việc: ${error?.message || e}`);
     }
     return Upload.LIST_IGNORE;
   };
@@ -782,9 +792,10 @@ export default function App() {
       setEditing(null);
       form.resetFields();
       await reloadUsers();
-    } catch (e: any) {
-      if (e?.errorFields) return; // ant form error
-      message.error(`Lưu nhân viên thất bại: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as { errorFields?: unknown; message?: string };
+      if (error?.errorFields) return; // ant form error
+      message.error(`Lưu nhân viên thất bại: ${error?.message || e}`);
     } finally {
       setSavingUser(false);
     }
@@ -814,7 +825,7 @@ export default function App() {
         {/* NEW: switch view */}
         <Segmented
           value={view}
-          onChange={(v) => setView(v as any)}
+          onChange={(v) => setView(v as "assign" | "stats")}
           options={[
             { label: "Phân công", value: "assign" },
             { label: "Thống kê", value: "stats" },
@@ -938,9 +949,10 @@ export default function App() {
                               message.success(
                                 `Đã lưu phân công ngày vào Firestore (tháng ${monthKey()}).`
                               );
-                            } catch (e: any) {
+                            } catch (e: unknown) {
+                              const error = e as Error;
                               message.error(
-                                `Lưu phân công thất bại: ${e?.message || e}`
+                                `Lưu phân công thất bại: ${error?.message || e}`
                               );
                             }
                           }}
@@ -1017,7 +1029,9 @@ export default function App() {
                       <Segmented
                         size="small"
                         value={statusFilter}
-                        onChange={(v) => setStatusFilter(v as any)}
+                        onChange={(v) =>
+                          setStatusFilter(v as "all" | "online" | "offline")
+                        }
                         options={[
                           { label: "Tất cả", value: "all" },
                           { label: "Online", value: "online" },

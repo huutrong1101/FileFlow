@@ -25,7 +25,7 @@ export async function logAssignmentToday(
     userCode: string;
     assignedCount?: number;
     assignedValue?: number;
-    meta?: any;
+    meta?: Record<string, unknown> | null;
   }>,
   forDate = new Date()
 ) {
@@ -48,7 +48,10 @@ export async function logAssignmentToday(
 export async function getMonthEntries(yyyyMM: string) {
   const entriesRef = collection(doc(db, MONTH_STATS, yyyyMM), "entries");
   const snap = await getDocs(entriesRef);
-  return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+  return snap.docs.map((d) => ({
+    id: d.id,
+    ...(d.data() as Record<string, unknown>),
+  }));
 }
 
 // Tổng hợp cuối tháng theo userCode
@@ -83,13 +86,20 @@ export async function getMonthAssignments(
   try {
     const entries = await getMonthEntries(mKey);
     if (entries.length) {
-      return entries.map((e: any) => ({
-        date: e?.date?.toDate ? e.date.toDate().toISOString().slice(0, 10) : "",
-        userCode: String(e.userCode || "").toUpperCase(),
-        assignedCount: Number(e.assignedCount || 0),
-      }));
+      return entries.map((e: Record<string, unknown>) => {
+        const dateField = e?.date as { toDate?: () => Date } | undefined;
+        return {
+          date: dateField?.toDate
+            ? dateField.toDate().toISOString().slice(0, 10)
+            : "",
+          userCode: String(e.userCode || "").toUpperCase(),
+          assignedCount: Number(e.assignedCount || 0),
+        };
+      });
     }
-  } catch (_) {}
+  } catch {
+    // Ignore error and try fallback methods
+  }
 
   // 1) Thử subcollection 'days'
   try {
@@ -102,10 +112,10 @@ export async function getMonthAssignments(
     }> = [];
     if (!snap.empty) {
       snap.forEach((d) => {
-        const data = d.data() as any;
+        const data = d.data() as Record<string, unknown>;
         const date = d.id; // giả định id = yyyy-MM-dd
         const items = Array.isArray(data?.items) ? data.items : [];
-        items.forEach((it: any) => {
+        items.forEach((it: Record<string, unknown>) => {
           out.push({
             date,
             userCode: String(it.userCode || "").toUpperCase(),
@@ -115,21 +125,25 @@ export async function getMonthAssignments(
       });
       if (out.length) return out;
     }
-  } catch (_) {}
+  } catch {
+    // Ignore error and try fallback methods
+  }
 
   // 2) Fallback đọc field 'logs' của doc tháng
   try {
     const monthDoc = await getDoc(doc(db, "monthStats", mKey));
     if (monthDoc.exists()) {
-      const data = monthDoc.data() as any;
+      const data = monthDoc.data() as Record<string, unknown>;
       const logs = Array.isArray(data?.logs) ? data.logs : [];
-      return logs.map((it: any) => ({
+      return logs.map((it: Record<string, unknown>) => ({
         date: String(it.date || ""),
         userCode: String(it.userCode || "").toUpperCase(),
         assignedCount: Number(it.assignedCount || 0),
       }));
     }
-  } catch (_) {}
+  } catch {
+    // Ignore error and return empty array
+  }
 
   return [];
 }

@@ -6,7 +6,7 @@ export interface User {
 }
 
 export interface TaskRow {
-  [key: string]: any;
+  [key: string]: unknown;
 }
 
 export interface AssignmentItem {

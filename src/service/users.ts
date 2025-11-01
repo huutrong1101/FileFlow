@@ -50,10 +50,10 @@ export async function listUsers(activeOnly = true) {
   const q = activeOnly ? query(ref, where("active", "==", true)) : ref;
   const snap = await getDocs(q);
   return snap.docs.map((d) => {
-    const data = d.data() as any;
+    const data = d.data() as Record<string, unknown>;
     return {
       code: d.id,
-      name: data.name ?? "",
+      name: String(data.name ?? ""),
       weightPct: Number(data.weightPct ?? 0),
       online: (data.status ?? "online") === "online",
     };

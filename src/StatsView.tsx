@@ -23,7 +23,9 @@ import {
 import type { User } from "./type";
 
 const { Text } = Typography;
-const { MonthPicker } = DatePicker as any;
+const MonthPicker = (
+  DatePicker as unknown as { MonthPicker: typeof DatePicker }
+).MonthPicker;
 
 type StatRow = {
   userCode: string;
@@ -58,8 +60,9 @@ const StatsView: React.FC<Props> = ({ initialUsers }) => {
     try {
       const data = await listUsers(true);
       setUsers(data);
-    } catch (e: any) {
-      message.error(`Lỗi tải users: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lỗi tải users: ${error?.message || e}`);
     }
   };
 
@@ -72,7 +75,13 @@ const StatsView: React.FC<Props> = ({ initialUsers }) => {
 
       // Đọc entries của tháng rồi tổng hợp theo user
       const entries = await getMonthEntries(mKey);
-      const agg = aggregateByUser(entries as any); // [{userCode, assignedCount, assignedValue}]
+      const agg = aggregateByUser(
+        entries as unknown as Array<{
+          userCode: string;
+          assignedCount?: number;
+          assignedValue?: number;
+        }>
+      );
 
       const data: StatRow[] = agg
         .map((it) => ({
@@ -83,8 +92,9 @@ const StatsView: React.FC<Props> = ({ initialUsers }) => {
         .sort((a, b) => b.total - a.total);
 
       setRows(data);
-    } catch (e: any) {
-      message.error(`Lỗi tải thống kê tháng: ${e?.message || e}`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lỗi tải thống kê tháng: ${error?.message || e}`);
     } finally {
       setLoading(false);
     }
@@ -92,10 +102,12 @@ const StatsView: React.FC<Props> = ({ initialUsers }) => {
 
   useEffect(() => {
     reloadUsersIfNeeded();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     loadMonth(month);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [month]);
 
   const cols: ColumnsType<StatRow> = [
