@@ -3,6 +3,8 @@ export interface User {
   name: string;
   weightPct: number;
   online: boolean;
+  warehouses?: string[];
+  order?: number;
 }
 
 export interface TaskRow {

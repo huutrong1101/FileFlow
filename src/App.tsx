@@ -26,6 +26,7 @@ import {
   Avatar,
   Empty,
   Popover,
+  Select,
 } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
@@ -52,14 +53,38 @@ import {
   upsertUsersBulk,
   upsertUser,
   deleteUser,
+  saveUsersOrdering,
 } from "./service/users";
 import { logAssignmentToday, monthKey } from "./service/monthStats";
 import type { AllocationSummary, AssignmentItem, TaskRow, User } from "./type";
+import { HolderOutlined } from "@ant-design/icons";
+import { CSS } from "@dnd-kit/utilities";
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  useSortable,
+  verticalListSortingStrategy,
+  arrayMove,
+} from "@dnd-kit/sortable";
 
 const { Header, Content } = Layout;
-const { Title, Text, Paragraph } = Typography;
+const { Title, Text } = Typography;
 
-import StatsView from "./StatsView"; // <-- thêm
+import { Tour } from "antd";
+import type { TourProps } from "antd";
+
+import { QuestionCircleOutlined } from "@ant-design/icons";
+
+import { useRef } from "react";
+
+import StatsView from "./StatsView";
 
 // ==================== UTILITIES ====================
 const stripDiacritics = (s: string) =>
@@ -129,6 +154,8 @@ async function parseUsersExcel(file: File): Promise<User[]> {
     "vang",
     "nghi",
   ]);
+  // NEW: cột mã kho (có thể là danh sách, phân tách bằng dấu phẩy)
+  const whKey = finder(["ma kho", "warehouse", "warehouses", "kho", "kho lam"]);
 
   const users: User[] = rows
     .map((r, i) => {
@@ -140,11 +167,23 @@ async function parseUsersExcel(file: File): Promise<User[]> {
       const online =
         !/^\s*(off|0|false|nghi|vang)\s*$/i.test(onlineVal) && onlineVal !== "";
 
+      // NEW: chuẩn hóa danh sách mã kho
+      const warehouses: string[] = (() => {
+        const raw = whKey ? String(r[whKey] ?? "").trim() : "";
+        if (!raw) return [];
+        return raw
+          .split(/[,\s;]+/)
+          .filter(Boolean)
+          .map((s) => normCode(s))
+          .filter((v, idx, arr) => arr.indexOf(v) === idx);
+      })();
+
       return {
         code,
         name,
         weightPct: Number.isFinite(w) ? Math.max(0, w) : 100,
         online,
+        warehouses, // NEW
       };
     })
     .filter((u) => u.code);
@@ -215,12 +254,33 @@ function sortRowsByGroupKeys(rows: TaskRow[], keys: string[]) {
 }
 
 // ==================== ALLOCATION ====================
-function allocateWeightedRoundRobin(
+function normForCompare(v: unknown) {
+  const s = normCode(String(v ?? "")).trim();
+  const noZeros = s.replace(/^0+/, "");
+  return { raw: s, noZeros };
+}
+
+function hasWarehouse(u: User, exportCode: unknown) {
+  const { raw: exp, noZeros: expNZ } = normForCompare(exportCode);
+  const ws = Array.isArray(u.warehouses) ? u.warehouses : [];
+  for (const w of ws) {
+    const { raw: wRaw, noZeros: wNZ } = normForCompare(w);
+    if (
+      exp &&
+      (exp === wRaw || exp === wNZ || expNZ === wRaw || expNZ === wNZ)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function allocatePreferWarehousesTwoPhase(
   users: User[],
-  rows: TaskRow[]
+  rows: TaskRow[],
+  exportKey: string | null
 ): { summary: AllocationSummary[]; assignments: AssignmentItem[] } {
   const active = users.filter((u) => u.online && u.weightPct > 0);
-
   if (!rows.length || !active.length) {
     return {
       summary: users.map((u) => ({
@@ -237,47 +297,114 @@ function allocateWeightedRoundRobin(
   const N = rows.length;
   const totalW = active.reduce((s, u) => s + u.weightPct, 0);
 
+  // quota mục tiêu
   const base = active.map((u) => Math.floor((N * u.weightPct) / totalW));
   const baseSum = base.reduce((s, x) => s + x, 0);
   const remainder = N - baseSum;
-
   const quota = base.slice();
-  for (let i = 0; i < remainder; i++) {
-    quota[i % active.length] += 1;
-  }
+  for (let i = 0; i < remainder; i++) quota[i % active.length] += 1;
 
-  const remain = quota.slice();
-  const counts = new Map<string, number>(users.map((u) => [u.code, 0]));
   const assignments: AssignmentItem[] = [];
+  const assignedCount = new Array(active.length).fill(0);
 
-  let cursor = 0;
+  // Sử dụng deficit "sống" ngay từ Pha A
+  const deficitLive = quota.slice(); // còn room mỗi user
+  const unassignedRowIdx: number[] = [];
+
+  // round-robin theo từng mã nơi xuất (chỉ xoay trong nhóm KHỚP-KHO còn room)
+  const perExportCursor = new Map<string, number>();
+  const pickInMatchesRR = (
+    indices: number[],
+    expKey: string
+  ): number | null => {
+    if (!indices.length) return null;
+    const cur = perExportCursor.get(expKey) ?? 0;
+    // quay 1 vòng tìm user còn room
+    for (let k = 0; k < indices.length; k++) {
+      const j = indices[(cur + k) % indices.length];
+      if (deficitLive[j] > 0) {
+        perExportCursor.set(expKey, (cur + k + 1) % indices.length);
+        return j;
+      }
+    }
+    return null; // không ai còn room
+  };
+
+  // —— PHA A: chỉ gán cho user KHỚP-KHO **còn thiếu** ——
   for (let i = 0; i < N; i++) {
-    let walked = 0;
-    while (walked < active.length && remain[cursor] === 0) {
-      cursor = (cursor + 1) % active.length;
-      walked++;
+    const exportCell = exportKey ? rows[i]?.[exportKey] : undefined;
+    const { raw: expRaw } = normForCompare(exportCell);
+    const expKey = expRaw || "__NO_EXPORT__";
+
+    let chosen: number | null = null;
+    if (exportKey && exportCell != null) {
+      const matchIndices: number[] = [];
+      for (let j = 0; j < active.length; j++) {
+        if (hasWarehouse(active[j], exportCell)) matchIndices.push(j);
+      }
+      chosen = pickInMatchesRR(matchIndices, expKey); // chỉ chọn nếu còn room
     }
 
-    if (remain[cursor] === 0) break;
+    if (chosen != null) {
+      const holder = active[chosen];
+      assignments.push({
+        userCode: holder.code,
+        userName: holder.name,
+        taskIndex: i,
+      });
+      assignedCount[chosen] += 1;
+      deficitLive[chosen] -= 1; // room giảm đi
+    } else {
+      // chưa gán ở Pha A -> để Pha B xử lý theo thiếu–đủ
+      unassignedRowIdx.push(i);
+    }
+  }
 
-    const holder = active[cursor];
+  // —— PHA B: rải phần còn lại theo thiếu–đủ (deficitLive) rồi RR ——
+  let globalCursor = 0;
+  const pickByDeficitThenRR = (): number => {
+    let bestIdx = -1,
+      bestDef = -Infinity;
+    for (let walked = 0; walked < active.length; walked++) {
+      const idx = (globalCursor + walked) % active.length;
+      const d = deficitLive[idx];
+      if (d > bestDef) {
+        bestDef = d;
+        bestIdx = idx;
+      }
+    }
+    if (bestDef > 0) {
+      globalCursor = (bestIdx + 1) % active.length;
+      return bestIdx;
+    }
+    // hết room → spillover vòng tròn
+    const idx = globalCursor;
+    globalCursor = (globalCursor + 1) % active.length;
+    return idx;
+  };
+
+  for (const rowIdx of unassignedRowIdx) {
+    const chosen = pickByDeficitThenRR();
+    const holder = active[chosen];
     assignments.push({
       userCode: holder.code,
       userName: holder.name,
-      taskIndex: i,
+      taskIndex: rowIdx,
     });
-
-    remain[cursor] -= 1;
-    counts.set(holder.code, (counts.get(holder.code) || 0) + 1);
-    cursor = (cursor + 1) % active.length;
+    assignedCount[chosen] += 1;
+    deficitLive[chosen] -= 1;
   }
+
+  const countMap = new Map<string, number>();
+  for (let k = 0; k < active.length; k++)
+    countMap.set(active[k].code, assignedCount[k]);
 
   const summary = users.map((u) => ({
     userCode: u.code,
     userName: u.name,
     weightPct: u.weightPct,
     online: u.online,
-    count: counts.get(u.code) || 0,
+    count: countMap.get(u.code) ?? 0,
   }));
 
   return { summary, assignments };
@@ -288,14 +415,19 @@ function exportExcelWithAssignments(
   users: User[],
   taskRows: TaskRow[],
   taskHeaders: string[],
-  summary: AllocationSummary[]
+  summary: AllocationSummary[],
+  exportKey: string | null // NEW
 ) {
   if (!summary.length) {
     message.warning("Chưa có kết quả để xuất.");
     return;
   }
 
-  const { assignments } = allocateWeightedRoundRobin(users, taskRows);
+  const { assignments } = allocatePreferWarehousesTwoPhase(
+    users,
+    taskRows,
+    exportKey
+  );
   const assignedMap = new Map<number, { code: string; name: string }>();
   assignments.forEach((a) =>
     assignedMap.set(a.taskIndex, { code: a.userCode, name: a.userName })
@@ -343,46 +475,6 @@ function exportExcelWithAssignments(
   URL.revokeObjectURL(url);
 }
 
-function exportSortedTasksExcel(taskRows: TaskRow[], taskHeaders: string[]) {
-  if (!taskRows.length) {
-    message.warning("Chưa có file công việc để xuất.");
-    return;
-  }
-
-  const finalHeaders = taskHeaders.length
-    ? taskHeaders
-    : Object.keys(taskRows[0] || {});
-  const rowsForSheet = taskRows.map((r) => {
-    const o: Record<string, unknown> = {};
-    for (const h of finalHeaders) o[h] = r[h] ?? "";
-    return o;
-  });
-
-  const ws = XLSX.utils.aoa_to_sheet([finalHeaders]);
-  XLSX.utils.sheet_add_json(ws, rowsForSheet, {
-    header: finalHeaders,
-    skipHeader: true,
-    origin: "A2",
-  });
-
-  const wb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(wb, ws, "CongViec_SapXep");
-
-  const out = XLSX.write(wb, { type: "array", bookType: "xlsx" });
-  const blob = new Blob([out], {
-    type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `cong_viec_da_sap_xep_${new Date()
-    .toISOString()
-    .slice(0, 19)
-    .replace(/[:T]/g, "-")}.xlsx`;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
 // ==================== MAIN COMPONENT ====================
 export default function App() {
   const [users, setUsers] = useState<User[]>([]);
@@ -390,6 +482,15 @@ export default function App() {
   const [taskHeaders, setTaskHeaders] = useState<string[]>([]);
   const [summary, setSummary] = useState<AllocationSummary[]>([]);
   const [view, setView] = useState<"assign" | "stats">("assign");
+  const [exportKey, setExportKey] = useState<string | null>(null);
+  const [showTour, setShowTour] = useState(false);
+
+  const refUpload = useRef<HTMLDivElement | null>(null);
+  const refAllocateBtn = useRef<HTMLButtonElement | null>(null);
+  const refUsersTable = useRef<HTMLDivElement | null>(null);
+  const refDownloadBtn = useRef<HTMLButtonElement | null>(null);
+  const refSegmented = useRef<HTMLDivElement | null>(null);
+  const refSummaryCard = useRef<HTMLDivElement | null>(null);
 
   // Loading & modal states
   const [loadingUsers, setLoadingUsers] = useState<boolean>(false);
@@ -401,6 +502,7 @@ export default function App() {
     name: string;
     weightPct: number;
     online: boolean;
+    warehouses?: string[];
   }>();
 
   // Tìm kiếm & lọc
@@ -421,18 +523,13 @@ export default function App() {
 
   const filteredUsers = useMemo(() => {
     const q = toKey(userQuery);
-    return users
-      .filter((u) => {
-        if (statusFilter === "online" && !u.online) return false;
-        if (statusFilter === "offline" && u.online) return false;
-        if (!q) return true;
-        const hay = `${toKey(u.code)} ${toKey(u.name)}`;
-        return hay.includes(q);
-      })
-      .sort((a, b) => {
-        if (a.online !== b.online) return a.online ? -1 : 1;
-        return b.weightPct - a.weightPct;
-      });
+    return users.filter((u) => {
+      if (statusFilter === "online" && !u.online) return false;
+      if (statusFilter === "offline" && u.online) return false;
+      if (!q) return true;
+      const hay = `${toKey(u.code)} ${toKey(u.name)}`;
+      return hay.includes(q);
+    });
   }, [users, userQuery, statusFilter]);
 
   // Load Users from Firestore
@@ -518,6 +615,15 @@ export default function App() {
 
   // ==================== TABLE COLUMNS ====================
   const userCols: ColumnsType<User> = [
+    {
+      title: "",
+      key: "drag",
+      width: 36,
+      className: "drag-visible",
+      render: () => (
+        <HolderOutlined style={{ cursor: "grab", color: "#999" }} />
+      ),
+    },
     {
       title: "Mã NV",
       dataIndex: "code",
@@ -620,6 +726,22 @@ export default function App() {
       showSorterTooltip: false,
     },
     {
+      title: "Mã kho",
+      key: "warehouses",
+      dataIndex: "warehouses",
+      width: 220,
+      render: (w: string[] | undefined) =>
+        w && w.length ? (
+          <Space size={[4, 4]} wrap>
+            {w.map((x) => (
+              <Tag key={x}>{x}</Tag>
+            ))}
+          </Space>
+        ) : (
+          <Text type="secondary">—</Text>
+        ),
+    },
+    {
       title: "Thao tác",
       key: "actions",
       fixed: "right",
@@ -637,6 +759,7 @@ export default function App() {
                   name: u.name,
                   weightPct: u.weightPct,
                   online: u.online,
+                  warehouses: u.warehouses ?? [],
                 });
                 setModalOpen(true);
               }}
@@ -752,6 +875,8 @@ export default function App() {
 
       setTaskRows(sortedRows);
       setTaskHeaders(headers);
+      setExportKey(exportKey ?? null); // NEW
+
       message.success(`Đã nạp & sắp xếp ${sortedRows.length} dòng công việc.`);
     } catch (e: unknown) {
       const error = e as Error;
@@ -760,16 +885,40 @@ export default function App() {
     return Upload.LIST_IGNORE;
   };
 
-  const handleAllocate = () => {
+  const handleAllocate = async () => {
     if (!taskRows.length)
       return message.warning("Chưa có công việc để phân bổ!");
     if (!users.length) return message.warning("Chưa có danh sách nhân viên!");
 
-    const { summary } = allocateWeightedRoundRobin(users, taskRows);
-    setSummary(summary);
+    // chạy phân bổ
+    const { summary: resultSummary } = allocatePreferWarehousesTwoPhase(
+      users,
+      taskRows,
+      exportKey ?? null
+    );
 
-    if (!summary.length) {
-      message.warning("Không có user online/weight > 0 để phân bổ.");
+    setSummary(resultSummary);
+
+    if (!resultSummary.length) {
+      return message.warning("Không có user online/weight > 0 để phân bổ.");
+    }
+
+    // LƯU NGAY vào Firestore
+    try {
+      await logAssignmentToday(
+        resultSummary.map((s) => ({
+          userCode: s.userCode,
+          assignedCount: s.count,
+          meta: {
+            source: "ui-allocate",
+            at: new Date().toISOString(),
+          },
+        }))
+      );
+      message.success(`Đã phân bổ & lưu vào Firestore (tháng ${monthKey()}).`);
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lưu phân công thất bại: ${error?.message || e}`);
     }
   };
 
@@ -784,6 +933,7 @@ export default function App() {
         status: vals.online ? "online" : "offline",
         weightPct: Number(vals.weightPct ?? 0),
         active: true,
+        warehouses: Array.isArray(vals.warehouses) ? vals.warehouses : [], // NEW
       });
       message.success(
         editing ? "Đã cập nhật nhân viên." : "Đã thêm nhân viên."
@@ -792,405 +942,518 @@ export default function App() {
       setEditing(null);
       form.resetFields();
       await reloadUsers();
-    } catch (e: unknown) {
-      const error = e as { errorFields?: unknown; message?: string };
-      if (error?.errorFields) return; // ant form error
-      message.error(`Lưu nhân viên thất bại: ${error?.message || e}`);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } catch (e: any) {
+      if (e?.errorFields) return;
+      message.error(`Lưu nhân viên thất bại: ${e?.message || e}`);
     } finally {
       setSavingUser(false);
     }
   };
 
+  const SortableRow: React.FC<{ id: string; children: React.ReactNode }> = ({
+    id,
+    children,
+  }) => {
+    const { attributes, listeners, setNodeRef, transform, transition } =
+      useSortable({ id });
+    const style: React.CSSProperties = {
+      transform: CSS.Transform.toString(transform),
+      transition,
+    };
+
+    return (
+      <tr ref={setNodeRef} style={style} {...attributes} {...listeners}>
+        {children}
+      </tr>
+    );
+  };
+
+  // Tạo sensors cho dnd-kit
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
+
+  // Hàm đổi thứ tự mảng users theo drag result
+  const onDragEndUsers = async (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const oldIndex = users.findIndex((u) => u.code === String(active.id));
+    const newIndex = users.findIndex((u) => u.code === String(over.id));
+    if (oldIndex === -1 || newIndex === -1) return;
+
+    const newUsers = arrayMove(users, oldIndex, newIndex);
+    setUsers(newUsers);
+
+    // Lưu order lên Firestore
+    try {
+      await saveUsersOrdering(newUsers.map((u) => u.code));
+      // (tuỳ chọn) message.success("Đã lưu thứ tự.");
+    } catch (e: unknown) {
+      const error = e as Error;
+      message.error(`Lưu thứ tự thất bại: ${error?.message || e}`);
+    }
+  };
+
+  // AntD Table components override
+  const components = {
+    body: {
+      row: (props: { "data-row-key"?: string; children: React.ReactNode }) => {
+        const record: User | undefined = props["data-row-key"] // antd injects
+          ? users.find((u) => normCode(u.code) === props["data-row-key"])
+          : undefined;
+        const id = record ? record.code : Math.random().toString();
+        return <SortableRow id={id}>{props.children}</SortableRow>;
+      },
+    },
+  };
+
+  useEffect(() => {
+    const FLAG = "APP_TOUR_DONE_V1";
+    if (!localStorage.getItem(FLAG)) {
+      setShowTour(true);
+      localStorage.setItem(FLAG, "1");
+    }
+  }, []);
+
+  const steps: TourProps["steps"] = [
+    {
+      title: "Chọn file công việc",
+      description: "Kéo/thả hoặc chọn file Excel.",
+      target: () => refUpload.current!,
+    },
+    {
+      title: "Phân bổ tự động & Lưu",
+      description:
+        "Nhấn 'Phân bổ' để phân công theo tỉ lệ và ưu tiên mã kho. Kết quả sẽ được ngay lập tức lưu trữ",
+      target: () => refAllocateBtn.current!,
+    },
+    {
+      title: "Danh sách nhân viên",
+      description:
+        "Kéo-thả để sắp thứ tự ưu tiên, chỉnh trạng thái Online/Offline và Tỉ lệ (Popover). Có thể thực hiện thêm, xóa, sửa thông tin user trong danh sách.",
+      target: () => refUsersTable.current!,
+    },
+    {
+      title: "Xuất báo cáo",
+      description:
+        "Sau khi phân bổ xong, nhấn để tải Excel gộp kết quả (mã NV & tên NV đã gán).",
+      target: () => refDownloadBtn.current!,
+    },
+    {
+      title: "Tóm tắt phân bổ",
+      description:
+        "Bảng này hiển thị KẾT QUẢ phân bổ. 'Số việc' là số dòng công việc được gán cho từng nhân viên.",
+      target: () => refSummaryCard.current!,
+    },
+    {
+      title: "Đổi chế độ xem",
+      description:
+        "Chuyển giữa màn 'Phân công' và 'Thống kê' để xem biểu đồ phân bổ theo tháng.",
+      target: () => refSegmented.current!,
+    },
+  ];
+
   // ==================== RENDER ====================
   return (
-    <Layout style={{ minHeight: "100vh" }}>
-      <Header
-        style={{
-          background: colorBgContainer,
-          borderBottom: `1px solid ${colorBorder}`,
-          padding: "0 24px",
-          boxShadow: "0 2px 8px rgba(0, 0, 0, 0.04)",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-        }}
-      >
-        <Space size={12} align="center">
-          <ThunderboltOutlined style={{ color: colorPrimary, fontSize: 20 }} />
-          <Title level={3} style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>
-            Quản lý phân công công việc
-          </Title>
-        </Space>
+    <>
+      <Layout style={{ minHeight: "100vh" }}>
+        <Header
+          style={{
+            background: colorBgContainer,
+            borderBottom: `1px solid ${colorBorder}`,
+            padding: "0 24px",
+            boxShadow: "0 2px 8px rgba(0, 0, 0, 0.04)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+          }}
+        >
+          <Space size={12} align="center">
+            <ThunderboltOutlined
+              style={{ color: colorPrimary, fontSize: 20 }}
+            />
+            <Title
+              level={3}
+              style={{ margin: 0, fontSize: 20, fontWeight: 700 }}
+            >
+              Quản lý phân công công việc
+            </Title>
+          </Space>
 
-        {/* NEW: switch view */}
-        <Segmented
-          value={view}
-          onChange={(v) => setView(v as "assign" | "stats")}
-          options={[
-            { label: "Phân công", value: "assign" },
-            { label: "Thống kê", value: "stats" },
-          ]}
-        />
-      </Header>
+          <Space align="center" size="middle" wrap>
+            <Tooltip title="Xem hướng dẫn nhanh">
+              <Button
+                type="text"
+                icon={<QuestionCircleOutlined />}
+                onClick={() => setShowTour(true)}
+                style={{ paddingInline: 8 }}
+              >
+                Xem hướng dẫn
+              </Button>
+            </Tooltip>
 
-      <Content style={{ padding: "24px", background: "#fafafa" }}>
-        {view === "assign" ? (
-          <>
-            <Row gutter={[16, 16]}>
-              {/* Tasks panel */}
-              <Col xs={24} lg={12}>
-                <Card
-                  style={{
-                    borderRadius,
-                    boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
-                    border: `1px solid ${colorBorder}`,
-                  }}
-                  bodyStyle={{ padding: "24px" }}
-                  title={
-                    <Space>
-                      <FileDoneOutlined style={{ color: colorPrimary }} />
-                      <span style={{ fontWeight: 600 }}>
-                        Tải file công việc
-                      </span>
-                    </Space>
-                  }
-                >
-                  <Space
-                    direction="vertical"
-                    style={{ width: "100%", gap: 16 }}
+            <Segmented
+              value={view}
+              onChange={(v) => setView(v as "assign" | "stats")}
+              options={[
+                { label: "Phân công", value: "assign" },
+                { label: "Thống kê", value: "stats" },
+              ]}
+            />
+          </Space>
+        </Header>
+
+        <Content style={{ padding: "24px", background: "#fafafa" }}>
+          {view === "assign" ? (
+            <>
+              <Row gutter={[16, 16]}>
+                <Col xs={24} lg={8}>
+                  <Card
+                    style={{
+                      borderRadius,
+                      boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
+                      border: `1px solid ${colorBorder}`,
+                    }}
+                    bodyStyle={{ padding: "24px" }}
+                    title={
+                      <Space>
+                        <FileDoneOutlined style={{ color: colorPrimary }} />
+                        <span style={{ fontWeight: 600 }}>
+                          Tải file công việc
+                        </span>
+                      </Space>
+                    }
                   >
-                    <Upload.Dragger
-                      maxCount={1}
-                      accept=".xlsx,.xls"
-                      beforeUpload={handleTasksFile}
-                      showUploadList={true}
-                      style={{
-                        borderRadius,
-                        background: `${colorPrimary}08`,
-                        borderColor: `${colorPrimary}30`,
-                      }}
+                    <Space
+                      direction="vertical"
+                      style={{ width: "100%", gap: 16 }}
                     >
-                      <p
-                        className="ant-upload-drag-icon"
-                        style={{ color: colorPrimary }}
-                      >
-                        <UploadOutlined style={{ fontSize: 32 }} />
-                      </p>
-                      <p
-                        className="ant-upload-text"
-                        style={{ fontSize: 14, fontWeight: 500 }}
-                      >
-                        Kéo/thả hoặc bấm để chọn file
-                      </p>
-                    </Upload.Dragger>
-
-                    <Row gutter={12}>
-                      <Col flex="auto">
-                        <div
+                      <div ref={refUpload}>
+                        <Upload.Dragger
+                          maxCount={1}
+                          accept=".xlsx,.xls"
+                          beforeUpload={handleTasksFile}
+                          showUploadList={true}
                           style={{
-                            background: `${colorPrimary}08`,
-                            padding: "12px 16px",
                             borderRadius,
-                            border: `1px solid ${colorPrimary}30`,
+                            background: `${colorPrimary}08`,
+                            borderColor: `${colorPrimary}30`,
                           }}
                         >
-                          <Statistic
-                            title={
-                              <Text
-                                style={{
-                                  fontSize: 12,
-                                  color: colorTextSecondary,
-                                }}
-                              >
-                                Số dòng công việc
-                              </Text>
-                            }
-                            value={taskRows.length}
-                            valueStyle={{ color: colorPrimary, fontSize: 22 }}
-                          />
-                        </div>
-                      </Col>
-                    </Row>
+                          <p
+                            className="ant-upload-drag-icon"
+                            style={{ color: colorPrimary }}
+                          >
+                            <UploadOutlined style={{ fontSize: 32 }} />
+                          </p>
+                          <p
+                            className="ant-upload-text"
+                            style={{ fontSize: 14, fontWeight: 500 }}
+                          >
+                            Kéo/thả hoặc bấm để chọn file
+                          </p>
+                        </Upload.Dragger>
+                      </div>
 
-                    {/* Action row: ưu tiên rõ ràng */}
-                    <Row gutter={[8, 8]}>
-                      <Col span={24}>
-                        <Button
-                          type="primary"
-                          onClick={handleAllocate}
-                          disabled={!taskRows.length || !users.length}
-                          block
-                          size="large"
-                          style={{ borderRadius, fontWeight: 600 }}
-                        >
-                          Phân bổ
-                        </Button>
-                      </Col>
+                      <Row gutter={12}>
+                        <Col flex="auto">
+                          <div
+                            style={{
+                              background: `${colorPrimary}08`,
+                              padding: "12px 16px",
+                              borderRadius,
+                              border: `1px solid ${colorPrimary}30`,
+                            }}
+                          >
+                            <Statistic
+                              title={
+                                <Text
+                                  style={{
+                                    fontSize: 12,
+                                    color: colorTextSecondary,
+                                  }}
+                                >
+                                  Số dòng công việc
+                                </Text>
+                              }
+                              value={taskRows.length}
+                              valueStyle={{ color: colorPrimary, fontSize: 22 }}
+                            />
+                          </div>
+                        </Col>
+                      </Row>
 
-                      <Col span={24}>
-                        <Button
-                          onClick={async () => {
-                            if (!summary.length) {
-                              return message.warning(
-                                "Chưa có kết quả phân bổ để lưu!"
-                              );
-                            }
-                            try {
-                              await logAssignmentToday(
-                                summary.map((s) => ({
-                                  userCode: s.userCode,
-                                  assignedCount: s.count,
-                                  meta: {
-                                    source: "ui-allocate",
-                                    at: new Date().toISOString(),
-                                  },
-                                }))
-                              );
-                              message.success(
-                                `Đã lưu phân công ngày vào Firestore (tháng ${monthKey()}).`
-                              );
-                            } catch (e: unknown) {
-                              const error = e as Error;
-                              message.error(
-                                `Lưu phân công thất bại: ${error?.message || e}`
-                              );
-                            }
-                          }}
-                          block
-                          size="large"
-                          style={{ borderRadius, fontWeight: 600 }}
-                        >
-                          Lưu phân công hôm nay
-                        </Button>
-                      </Col>
-
-                      <Col xs={24}>
-                        <Space.Compact block>
+                      {/* Action row: ưu tiên rõ ràng */}
+                      <Row gutter={[8, 8]}>
+                        <Col span={24}>
                           <Button
+                            ref={refAllocateBtn}
+                            type="primary"
+                            onClick={handleAllocate}
+                            disabled={!taskRows.length || !users.length}
+                            block
+                            size="large"
+                            style={{ borderRadius, fontWeight: 600 }}
+                          >
+                            Phân bổ
+                          </Button>
+                        </Col>
+
+                        <Col span={24}>
+                          <Button
+                            ref={refDownloadBtn}
                             icon={<DownloadOutlined />}
                             onClick={() =>
                               exportExcelWithAssignments(
                                 users,
                                 taskRows,
                                 taskHeaders,
-                                summary
+                                summary,
+                                exportKey ?? null
                               )
                             }
                             disabled={!summary.length}
                             size="large"
+                            block
+                            style={{ borderRadius, fontWeight: 600 }}
                           >
                             Tải Excel (đã phân bổ)
                           </Button>
-                          <Button
-                            icon={<DownloadOutlined />}
-                            onClick={() =>
-                              exportSortedTasksExcel(taskRows, taskHeaders)
-                            }
-                            disabled={!taskRows.length}
-                            size="large"
-                          >
-                            Tải Excel (đã sắp xếp)
-                          </Button>
-                        </Space.Compact>
-                      </Col>
-                    </Row>
-                  </Space>
-                </Card>
-              </Col>
+                        </Col>
+                      </Row>
+                    </Space>
+                  </Card>
+                </Col>
 
-              {/* Users panel */}
-              <Col xs={24} lg={12}>
-                <Card
-                  size="small"
-                  title={
-                    <Space size={6} align="center">
-                      <TeamOutlined style={{ color: colorPrimary }} />
-                      <span style={{ color: colorPrimary, fontWeight: 600 }}>
-                        Danh sách NV
-                      </span>
-                    </Space>
-                  }
-                  style={{
-                    borderRadius,
-                    boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
-                    border: `1px solid ${colorBorder}`,
-                  }}
-                  extra={
-                    <Space wrap>
-                      <Input
-                        allowClear
-                        size="small"
-                        prefix={<SearchOutlined />}
-                        placeholder="Tìm theo mã / tên"
-                        style={{ width: 220 }}
-                        value={userQuery}
-                        onChange={(e) => setUserQuery(e.target.value)}
-                      />
-                      <Segmented
-                        size="small"
-                        value={statusFilter}
-                        onChange={(v) =>
-                          setStatusFilter(v as "all" | "online" | "offline")
-                        }
-                        options={[
-                          { label: "Tất cả", value: "all" },
-                          { label: "Online", value: "online" },
-                          { label: "Offline", value: "offline" },
-                        ]}
-                      />
-                      <Tooltip title="Tải lại">
-                        <Button
-                          size="small"
-                          icon={<ReloadOutlined />}
-                          onClick={reloadUsers}
-                        />
-                      </Tooltip>
-                      <Button
-                        size="small"
-                        type="primary"
-                        icon={<PlusOutlined />}
-                        onClick={() => {
-                          setEditing(null);
-                          form.resetFields();
-                          form.setFieldsValue({
-                            code: "",
-                            name: "",
-                            weightPct: 100,
-                            online: true,
-                          });
-                          setModalOpen(true);
-                        }}
-                      >
-                        Thêm
-                      </Button>
-                      <Upload
-                        beforeUpload={handleUserFile}
-                        maxCount={1}
-                        accept=".xlsx,.xls"
-                      >
-                        <Button
-                          size="small"
-                          icon={<DatabaseOutlined />}
-                          style={{ fontSize: 12 }}
-                        >
-                          Nhập
-                        </Button>
-                      </Upload>
-                    </Space>
-                  }
-                  bodyStyle={{ padding: "16px" }}
-                >
-                  <Table<User>
-                    rowKey={(u) => normCode(u.code)}
-                    dataSource={filteredUsers}
-                    columns={userCols}
-                    size="middle"
-                    pagination={{ pageSize: 10, showSizeChanger: true }}
-                    scroll={{ y: 360, x: true }}
-                    loading={loadingUsers}
-                    sticky
-                    bordered
-                    locale={{
-                      emptyText: (
-                        <Empty
-                          description={
-                            <span>
-                              Chưa có nhân viên. Bấm <Text strong>Thêm</Text>{" "}
-                              hoặc <Text strong>Nhập</Text> từ Excel.
-                            </span>
-                          }
-                        />
-                      ),
-                    }}
-                  />
-                </Card>
-              </Col>
-            </Row>
-
-            <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
-              <Col xs={24}>
-                <Card
-                  title={
-                    <Space size={6}>
-                      <TeamOutlined style={{ color: colorPrimary }} />
-                      <span style={{ fontWeight: 600 }}>Tóm tắt phân bổ</span>
-                    </Space>
-                  }
-                  style={{
-                    borderRadius,
-                    boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
-                    border: `1px solid ${colorBorder}`,
-                  }}
-                  bodyStyle={{ padding: 0 }}
-                >
-                  <Table<AllocationSummary>
-                    rowKey="userCode"
+                {/* Users panel */}
+                <Col xs={24} lg={16}>
+                  <Card
                     size="small"
-                    dataSource={summary}
-                    columns={sumCols}
-                    pagination={{ pageSize: 10 }}
-                    scroll={{ x: true }}
-                    bordered
-                  />
-                </Card>
-              </Col>
-            </Row>
-          </>
-        ) : (
-          <StatsView initialUsers={users} />
-        )}
-      </Content>
+                    title={
+                      <Space size={6} align="center">
+                        <TeamOutlined style={{ color: colorPrimary }} />
+                        <span style={{ color: colorPrimary, fontWeight: 600 }}>
+                          Danh sách NV
+                        </span>
+                      </Space>
+                    }
+                    style={{
+                      borderRadius,
+                      boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
+                      border: `1px solid ${colorBorder}`,
+                    }}
+                    extra={
+                      <Space wrap>
+                        <Input
+                          allowClear
+                          size="small"
+                          prefix={<SearchOutlined />}
+                          placeholder="Tìm theo mã / tên"
+                          style={{ width: 220 }}
+                          value={userQuery}
+                          onChange={(e) => setUserQuery(e.target.value)}
+                        />
+                        <Segmented
+                          size="small"
+                          value={statusFilter}
+                          onChange={(v) =>
+                            setStatusFilter(v as "all" | "online" | "offline")
+                          }
+                          options={[
+                            { label: "Tất cả", value: "all" },
+                            { label: "Online", value: "online" },
+                            { label: "Offline", value: "offline" },
+                          ]}
+                        />
+                        <Tooltip title="Tải lại">
+                          <Button
+                            size="small"
+                            icon={<ReloadOutlined />}
+                            onClick={reloadUsers}
+                          />
+                        </Tooltip>
+                        <Button
+                          size="small"
+                          type="primary"
+                          icon={<PlusOutlined />}
+                          onClick={() => {
+                            setEditing(null);
+                            form.resetFields();
+                            form.setFieldsValue({
+                              code: "",
+                              name: "",
+                              weightPct: 100,
+                              online: true,
+                              warehouses: [],
+                            });
+                            setModalOpen(true);
+                          }}
+                        >
+                          Thêm
+                        </Button>
+                        <Upload
+                          beforeUpload={handleUserFile}
+                          maxCount={1}
+                          accept=".xlsx,.xls"
+                        >
+                          <Button
+                            size="small"
+                            icon={<DatabaseOutlined />}
+                            style={{ fontSize: 12 }}
+                          >
+                            Nhập
+                          </Button>
+                        </Upload>
+                      </Space>
+                    }
+                    bodyStyle={{ padding: "16px" }}
+                  >
+                    <DndContext
+                      sensors={sensors}
+                      collisionDetection={closestCenter}
+                      onDragEnd={onDragEndUsers}
+                    >
+                      <SortableContext
+                        items={filteredUsers.map((u) => u.code)}
+                        strategy={verticalListSortingStrategy}
+                      >
+                        <div ref={refUsersTable}>
+                          <Table<User>
+                            rowKey={(u) => normCode(u.code)}
+                            dataSource={filteredUsers}
+                            columns={userCols}
+                            size="middle"
+                            pagination={false}
+                            scroll={{ y: 360, x: true }}
+                            loading={loadingUsers}
+                            sticky
+                            bordered
+                            components={components}
+                            locale={{
+                              emptyText: (
+                                <Empty
+                                  description={
+                                    <span>
+                                      Chưa có nhân viên. Bấm{" "}
+                                      <Text strong>Thêm</Text> hoặc{" "}
+                                      <Text strong>Nhập</Text> từ Excel.
+                                    </span>
+                                  }
+                                />
+                              ),
+                            }}
+                          />
+                        </div>
+                      </SortableContext>
+                    </DndContext>
+                  </Card>
+                </Col>
+              </Row>
 
-      <Modal
-        title={editing ? `Sửa nhân viên: ${editing.code}` : "Thêm nhân viên"}
-        open={modalOpen}
-        onCancel={() => {
-          setModalOpen(false);
-          setEditing(null);
-          form.resetFields();
-        }}
-        onOk={submitUserForm}
-        okText={editing ? "Cập nhật" : "Thêm"}
-        confirmLoading={savingUser}
-        destroyOnClose
-      >
-        <Form form={form} layout="vertical">
-          <Form.Item
-            label="Mã NV"
-            name="code"
-            rules={[
-              { required: true, message: "Vui lòng nhập mã NV" },
-              {
-                pattern: /^[A-Za-z0-9_-]+$/,
-                message: "Chỉ chữ/số/gạch dưới/gạch ngang",
-              },
-            ]}
-          >
-            <Input placeholder="VD: U001" disabled={!!editing} />
-          </Form.Item>
-          <Form.Item
-            label="Tên"
-            name="name"
-            rules={[{ required: true, message: "Vui lòng nhập tên" }]}
-          >
-            <Input placeholder="VD: Nguyễn Văn A" />
-          </Form.Item>
-          <Form.Item label="Tỉ lệ (%)" name="weightPct" initialValue={100}>
-            <InputNumber min={0} max={300} style={{ width: "100%" }} />
-          </Form.Item>
-          <Form.Item
-            label="Online"
-            name="online"
-            valuePropName="checked"
-            initialValue={true}
-          >
-            <Switch />
-          </Form.Item>
-          <Paragraph type="secondary" style={{ marginTop: 4 }}>
-            Gợi ý: 100% là chuẩn, &gt;=150% là cao, &lt;100% là thấp.
-          </Paragraph>
-        </Form>
-      </Modal>
-    </Layout>
+              <Row gutter={[16, 16]} style={{ marginTop: 16 }}>
+                <Col xs={24}>
+                  <div ref={refSummaryCard}>
+                    <Card
+                      title={
+                        <Space size={6}>
+                          <TeamOutlined style={{ color: colorPrimary }} />
+                          <span style={{ fontWeight: 600 }}>
+                            Tóm tắt phân bổ
+                          </span>
+                        </Space>
+                      }
+                      style={{
+                        borderRadius,
+                        boxShadow: "0 2px 8px rgba(0, 0, 0, 0.06)",
+                        border: `1px solid ${colorBorder}`,
+                      }}
+                      bodyStyle={{ padding: 0 }}
+                    >
+                      <Table<AllocationSummary>
+                        rowKey="userCode"
+                        size="small"
+                        dataSource={summary}
+                        columns={sumCols}
+                        pagination={{ pageSize: 10 }}
+                        scroll={{ x: true }}
+                        bordered
+                      />
+                    </Card>
+                  </div>
+                </Col>
+              </Row>
+            </>
+          ) : (
+            <StatsView initialUsers={users} />
+          )}
+        </Content>
+
+        <Modal
+          title={editing ? `Sửa nhân viên: ${editing.code}` : "Thêm nhân viên"}
+          open={modalOpen}
+          onCancel={() => {
+            setModalOpen(false);
+            setEditing(null);
+            form.resetFields();
+          }}
+          onOk={submitUserForm}
+          okText={editing ? "Cập nhật" : "Thêm"}
+          confirmLoading={savingUser}
+          destroyOnClose
+        >
+          <Form form={form} layout="vertical">
+            <Form.Item
+              label="Mã NV"
+              name="code"
+              rules={[
+                { required: true, message: "Vui lòng nhập mã NV" },
+                {
+                  pattern: /^[A-Za-z0-9_-]+$/,
+                  message: "Chỉ chữ/số/gạch dưới/gạch ngang",
+                },
+              ]}
+            >
+              <Input placeholder="VD: U001" disabled={!!editing} />
+            </Form.Item>
+            <Form.Item
+              label="Tên"
+              name="name"
+              rules={[{ required: true, message: "Vui lòng nhập tên" }]}
+            >
+              <Input placeholder="VD: Nguyễn Văn A" />
+            </Form.Item>
+            <Form.Item label="Tỉ lệ (%)" name="weightPct" initialValue={100}>
+              <InputNumber min={0} max={300} style={{ width: "100%" }} />
+            </Form.Item>
+            <Form.Item
+              label="Online"
+              name="online"
+              valuePropName="checked"
+              initialValue={true}
+            >
+              <Switch />
+            </Form.Item>
+            <Form.Item label="Mã kho (có thể nhập nhiều)" name="warehouses">
+              <Select
+                mode="tags"
+                tokenSeparators={[",", ";", " "]}
+                placeholder="VD: KHO001, KHO002"
+                // Chuẩn hóa input về normCode khi thay đổi
+                onChange={(vals) => {
+                  const normalized = (vals as string[])
+                    .map((s) => normCode(String(s)))
+                    .filter(Boolean)
+                    .filter((v, idx, arr) => arr.indexOf(v) === idx);
+                  form.setFieldsValue({ warehouses: normalized });
+                }}
+              />
+            </Form.Item>
+          </Form>
+        </Modal>
+      </Layout>
+      <Tour open={showTour} onClose={() => setShowTour(false)} steps={steps} />
+    </>
   );
 }

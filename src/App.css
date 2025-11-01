@@ -1,1 +1,15 @@
 @import "tailwindcss";
+
+/* users-compact-table: giảm padding để hiển thị được nhiều dòng hơn */
+.users-compact-table .ant-table-tbody > tr > td,
+.users-compact-table .ant-table-thead > tr > th {
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+
+.users-compact-table .ant-avatar-sm {
+  width: 22px;
+  height: 22px;
+  line-height: 22px;
+  font-size: 12px;
+}
