@@ -24,3 +24,11 @@ export interface AllocationSummary {
   online: boolean;
   count: number;
 }
+
+export type MonthAgg = {
+  expectedCum: Record<string, number>;
+  actualCum: Record<string, number>;
+  deficit: Record<string, number>;
+  lastServedAt: Record<string, string>;
+  version?: string;
+};

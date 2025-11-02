@@ -55,7 +55,12 @@ import {
   deleteUser,
   saveUsersOrdering,
 } from "./service/users";
-import { logAssignmentToday, monthKey } from "./service/monthStats";
+import {
+  logAssignmentToday,
+  monthKey,
+  reorderUsersByDeficit,
+  settleDayAndGetAgg,
+} from "./service/monthStats";
 import type { AllocationSummary, AssignmentItem, TaskRow, User } from "./type";
 import { HolderOutlined } from "@ant-design/icons";
 import { CSS } from "@dnd-kit/utilities";
@@ -890,7 +895,6 @@ export default function App() {
       return message.warning("Chưa có công việc để phân bổ!");
     if (!users.length) return message.warning("Chưa có danh sách nhân viên!");
 
-    // chạy phân bổ
     const { summary: resultSummary } = allocatePreferWarehousesTwoPhase(
       users,
       taskRows,
@@ -898,27 +902,41 @@ export default function App() {
     );
 
     setSummary(resultSummary);
-
     if (!resultSummary.length) {
       return message.warning("Không có user online/weight > 0 để phân bổ.");
     }
 
-    // LƯU NGAY vào Firestore
     try {
+      // 1) Lưu entries ngày (như cũ)
       await logAssignmentToday(
         resultSummary.map((s) => ({
           userCode: s.userCode,
           assignedCount: s.count,
-          meta: {
-            source: "ui-allocate",
-            at: new Date().toISOString(),
-          },
+          meta: { source: "ui-allocate", at: new Date().toISOString() },
         }))
       );
-      message.success(`Đã phân bổ & lưu vào Firestore (tháng ${monthKey()}).`);
+
+      // 2) NEW: settle ngày -> cập nhật aggregate tháng theo trọng số NGÀY HÔM NAY
+      const agg = await settleDayAndGetAgg({
+        forDate: new Date(),
+        users, // cần code/online/weightPct hiện tại
+        summary: resultSummary.map((s) => ({
+          userCode: s.userCode,
+          count: s.count,
+        })),
+      });
+
+      // 3) NEW: reorder danh sách cho NGÀY SAU theo deficit tháng
+      const reordered = reorderUsersByDeficit(users, agg);
+      setUsers(reordered);
+      await saveUsersOrdering(reordered.map((u) => u.code));
+
+      message.success(
+        `Đã phân bổ & lưu vào Firestore (tháng ${monthKey()}). Đã sắp xếp ưu tiên ngày mai.`
+      );
     } catch (e: unknown) {
       const error = e as Error;
-      message.error(`Lưu phân công thất bại: ${error?.message || e}`);
+      message.error(`Lưu phân công/aggregate thất bại: ${error?.message || e}`);
     }
   };
 
@@ -951,19 +969,27 @@ export default function App() {
     }
   };
 
-  const SortableRow: React.FC<{ id: string; children: React.ReactNode }> = ({
-    id,
-    children,
-  }) => {
+  const SortableRow: React.FC<
+    { id: string } & React.HTMLAttributes<HTMLTableRowElement>
+  > = ({ id, style, className, children, ...rest }) => {
     const { attributes, listeners, setNodeRef, transform, transition } =
       useSortable({ id });
-    const style: React.CSSProperties = {
+
+    const mergedStyle: React.CSSProperties = {
+      ...style,
       transform: CSS.Transform.toString(transform),
       transition,
     };
 
     return (
-      <tr ref={setNodeRef} style={style} {...attributes} {...listeners}>
+      <tr
+        ref={setNodeRef}
+        className={className}
+        style={mergedStyle}
+        {...attributes}
+        {...listeners}
+        {...rest}
+      >
         {children}
       </tr>
     );
@@ -999,16 +1025,19 @@ export default function App() {
   // AntD Table components override
   const components = {
     body: {
-      row: (props: { "data-row-key"?: string; children: React.ReactNode }) => {
-        const record: User | undefined = props["data-row-key"] // antd injects
+      row: (
+        props: {
+          "data-row-key"?: string;
+        } & React.HTMLAttributes<HTMLTableRowElement>
+      ) => {
+        const record: User | undefined = props["data-row-key"]
           ? users.find((u) => normCode(u.code) === props["data-row-key"])
           : undefined;
         const id = record ? record.code : Math.random().toString();
-        return <SortableRow id={id}>{props.children}</SortableRow>;
+        return <SortableRow id={id} {...props} />;
       },
     },
   };
-
   useEffect(() => {
     const FLAG = "APP_TOUR_DONE_V1";
     if (!localStorage.getItem(FLAG)) {
@@ -1328,7 +1357,6 @@ export default function App() {
                             pagination={false}
                             scroll={{ y: 360, x: true }}
                             loading={loadingUsers}
-                            sticky
                             bordered
                             components={components}
                             locale={{
