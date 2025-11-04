@@ -307,7 +307,7 @@ function allocatePreferWarehousesTwoPhase(
   arg4?: string | null,
   arg5?: string | null
 ): { summary: AllocationSummary[]; assignments: AssignmentItem[] } {
-  // Chuẩn hoá tham số -> AllocOpts
+  // ==== Chuẩn hoá opts ====
   const opts: AllocOpts =
     typeof arg3 === "object" && arg3 !== null
       ? {
@@ -323,7 +323,7 @@ function allocatePreferWarehousesTwoPhase(
 
   const { exportKey, voucherKey, stKey } = opts;
 
-  // Chỉ lấy user đang online & weight > 0 để phân
+  // Lọc user active (đang online và weight > 0)
   const active = users.filter((u) => u.online && u.weightPct > 0);
 
   if (!rows.length || !active.length) {
@@ -339,7 +339,10 @@ function allocatePreferWarehousesTwoPhase(
     };
   }
 
-  // ===== Tính quota theo trọng số (Largest Remainder / Hamilton) =====
+  // ==== Ưu tiên theo thứ tự hiển thị: ai đứng TRÊN có rank nhỏ hơn ====
+  const orderRank: number[] = active.map((_u, idx) => idx);
+
+  // ==== Tính quota theo Hamilton (Largest Remainder) ====
   const N = rows.length;
   const totalW = active.reduce((s, u) => s + u.weightPct, 0);
 
@@ -355,11 +358,9 @@ function allocatePreferWarehousesTwoPhase(
     const fracs = shares.map((x, i) => x - base[i]);
     const baseSum = base.reduce((s, x) => s + x, 0);
     const remLR = N - baseSum;
-
     const idxs = fracs
       .map((f, i) => ({ i, f }))
       .sort((a, b) => (b.f === a.f ? a.i - b.i : b.f - a.f));
-
     quota = base.slice();
     for (let k = 0; k < remLR; k++) quota[idxs[k].i] += 1;
   }
@@ -368,8 +369,7 @@ function allocatePreferWarehousesTwoPhase(
   const assignedCount = new Array(active.length).fill(0);
   const deficitLive = quota.slice(); // >0 còn room; 0 đủ; <0 đã vượt
 
-  // ===== Giới hạn số mã kho "ngoại" theo TỪNG USER =====
-  // Rule: weightPct >= 100 -> tối đa 2 mã kho "ngoại"; weightPct < 100 -> tối đa 1
+  // ==== Giới hạn "kho ngoại" theo từng user ====
   const foreignLimit: number[] = active.map((u) =>
     u.weightPct >= 100 ? 2 : 1
   );
@@ -387,24 +387,14 @@ function allocatePreferWarehousesTwoPhase(
 
   const allowUserForExp = (i: number, expRaw: unknown) => {
     const expKey = normExpKey(expRaw);
-    if (expKey === "__NO_EXPORT__") return true; // không ràng buộc khi thiếu mã nơi xuất
-    if (isMatched(i, expRaw)) return true; // khớp kho -> luôn OK
-
+    if (expKey === "__NO_EXPORT__") return true; // không có mã nơi xuất -> bỏ qua ràng buộc
+    if (isMatched(i, expRaw)) return true; // khớp kho -> OK
     const used = foreignExports[i];
-    if (used.has(expKey)) return true; // đã có mã này rồi -> OK
-    return used.size < foreignLimit[i]; // còn slot "ngoại" cho user i?
+    if (used.has(expKey)) return true; // đã dùng mã ngoại này -> OK
+    return used.size < foreignLimit[i]; // còn slot kho ngoại?
   };
 
-  // ===== Helpers =====
-  const perExportCursor = new Map<string, number>();
-  const nextRR = (key: string, pool: number[]) => {
-    if (!pool.length) return null;
-    const cur = perExportCursor.get(key) ?? 0;
-    const idx = pool[cur % pool.length];
-    perExportCursor.set(key, (cur + 1) % pool.length);
-    return idx;
-  };
-
+  // ==== Helpers chọn theo deficit (tie-break bằng orderRank) ====
   const pickByDeficit = (pool: number[]) => {
     let best = -1;
     let bestDef = -Infinity;
@@ -413,6 +403,9 @@ function allocatePreferWarehousesTwoPhase(
       if (d > bestDef) {
         bestDef = d;
         best = i;
+      } else if (d === bestDef && best !== -1) {
+        // Ưu tiên người đứng TRÊN trong bảng khi hòa điểm
+        if (orderRank[i] < orderRank[best]) best = i;
       }
     }
     return best;
@@ -420,9 +413,11 @@ function allocatePreferWarehousesTwoPhase(
 
   const pickGlobalByDeficit = (candidates?: number[]) => {
     const pool = candidates ?? [...Array(active.length).keys()];
+    // Ưu tiên ai còn room
     const withRoom = pool.filter((i) => deficitLive[i] > 0);
     if (withRoom.length) return pickByDeficit(withRoom);
 
+    // Tất cả đã đủ quota -> chọn người "ít vượt" nhất; hòa tiếp thì ưu tiên đứng TRÊN
     let best = pool[0];
     let bestDef = -Infinity;
     for (const i of pool) {
@@ -430,42 +425,29 @@ function allocatePreferWarehousesTwoPhase(
       if (d > bestDef) {
         bestDef = d;
         best = i;
+      } else if (d === bestDef) {
+        if (orderRank[i] < orderRank[best]) best = i;
       }
     }
     return best;
   };
 
-  // ===== Chính sách dính voucher theo block liên tiếp =====
+  // ==== Bám voucher có overflow nhỏ ====
+  // Đặt 1–2; 0 nếu muốn tuyệt đối không vượt vì voucher.
   const VOUCHER_OVERFLOW_LIMIT = 1;
   let currentVoucher = "";
   let currentVoucherOwner: number | null = null;
   let currentVoucherOverflowUsed = 0;
 
-  // ST ưu tiên (không vượt quota)
+  // Ghi nhớ ST owner (chỉ ưu tiên khi còn room)
   const stOwner = new Map<string, number>();
 
-  // ===== Giới hạn overflow theo nơi xuất (per export & per user) =====
-  const EXPORT_OVERFLOW_LIMIT = 1;
-  const exportOverflowUsed = new Map<string, Map<number, number>>();
-  const incExportOverflow = (expKey: string, idx: number) => {
-    let inner = exportOverflowUsed.get(expKey);
-    if (!inner) {
-      inner = new Map<number, number>();
-      exportOverflowUsed.set(expKey, inner);
-    }
-    inner.set(idx, (inner.get(idx) ?? 0) + 1);
-  };
-  const canExportOverflow = (expKey: string, idx: number) => {
-    const inner = exportOverflowUsed.get(expKey);
-    return (inner?.get(idx) ?? 0) < EXPORT_OVERFLOW_LIMIT;
-  };
+  // (ĐÃ BỎ) Export overflow per-export/per-user để siết quota
 
   for (let rIdx = 0; rIdx < N; rIdx++) {
     const row = rows[rIdx];
 
-    // Chuẩn hoá keys
     const expRaw = exportKey ? row[exportKey] : undefined;
-    const expKey = normExpKey(expRaw);
 
     const vRaw = voucherKey ? String(row[voucherKey] ?? "").trim() : "";
     const vKey = vRaw ? normCode(vRaw) : "";
@@ -480,71 +462,68 @@ function allocatePreferWarehousesTwoPhase(
       currentVoucherOverflowUsed = 0;
     }
 
-    // Pool ôm kho (khớp export với user.warehouses)
+    // Pool khớp kho
     const matched: number[] = [];
     if (expRaw != null) {
-      for (let i = 0; i < active.length; i++) {
-        if (hasWarehouse(active[i], expRaw)) matched.push(i);
-      }
+      for (let i = 0; i < active.length; i++)
+        if (isMatched(i, expRaw)) matched.push(i);
     }
 
     let chosen: number | null = null;
 
-    // 0) Dính voucher owner nếu có (và hợp lệ theo allowUserForExp)
-    if (vKey && currentVoucherOwner != null) {
+    // 0) Bám voucher owner: ưu tiên khi còn room; nếu hết room -> cho vượt <= VOUCHER_OVERFLOW_LIMIT
+    if (
+      vKey &&
+      currentVoucherOwner != null &&
+      allowUserForExp(currentVoucherOwner, expRaw)
+    ) {
       const owner: number = currentVoucherOwner;
-      if (allowUserForExp(owner, expRaw)) {
-        if (deficitLive[owner] > 0) {
-          chosen = owner;
-        } else if (currentVoucherOverflowUsed < VOUCHER_OVERFLOW_LIMIT) {
-          chosen = owner;
-          currentVoucherOverflowUsed += 1;
-        }
+      if (deficitLive[owner] > 0) {
+        chosen = owner;
+      } else if (currentVoucherOverflowUsed < VOUCHER_OVERFLOW_LIMIT) {
+        chosen = owner;
+        currentVoucherOverflowUsed += 1;
       }
     }
 
-    // 1) Ưu tiên pool ôm kho
+    // 1) Ưu tiên pool khớp kho NHƯNG CHỈ khi còn room & hợp lệ allowUserForExp
     if (chosen == null && matched.length) {
-      const bestRoom = matched.filter((i) => deficitLive[i] > 0);
-      if (bestRoom.length) {
-        const bestByDef = pickByDeficit(bestRoom);
-        const tie = bestRoom.filter(
-          (i) => deficitLive[i] === deficitLive[bestByDef]
-        );
-        chosen =
-          tie.length > 1 ? (nextRR(`EXP_${expKey}`, tie) as number) : bestByDef;
-      } else {
-        // hết room -> overflow theo export, đồng thời phải hợp lệ theo giới hạn "ngoại"
-        const overflowCandidates = matched
-          .filter((i) => canExportOverflow(expKey, i))
-          .filter((i) => allowUserForExp(i, expRaw));
-        if (overflowCandidates.length) {
-          chosen = nextRR(`EXP_${expKey}`, overflowCandidates) as number;
-          incExportOverflow(expKey, chosen);
-        }
+      const matchedWithRoom = matched.filter(
+        (i) => deficitLive[i] > 0 && allowUserForExp(i, expRaw)
+      );
+      if (matchedWithRoom.length) {
+        chosen = pickByDeficit(matchedWithRoom);
       }
     }
 
-    // 2) ST owner nếu còn room & hợp lệ theo ràng buộc "ngoại"
+    // 2) ST owner (nếu còn room & hợp lệ allowUserForExp)
     if (chosen == null && stVal && stOwner.has(stVal)) {
-      const stIdx = stOwner.get(stVal)!;
-      if (deficitLive[stIdx] > 0 && allowUserForExp(stIdx, expRaw)) {
-        chosen = stIdx;
+      const idx = stOwner.get(stVal)!;
+      if (deficitLive[idx] > 0 && allowUserForExp(idx, expRaw)) {
+        chosen = idx;
       }
     }
 
-    // 3) Toàn cục: chỉ xét người hợp lệ theo allowUserForExp
+    // 3A) Pha 1: Toàn cục — ƯU TIÊN đạt quota trước, KHÔNG để ràng buộc kho ngoại chặn
     if (chosen == null) {
-      const allowed: number[] = [];
-      for (let i = 0; i < active.length; i++) {
-        if (allowUserForExp(i, expRaw)) allowed.push(i);
+      const poolWithRoom: number[] = [];
+      for (let i = 0; i < active.length; i++)
+        if (deficitLive[i] > 0) poolWithRoom.push(i);
+
+      if (poolWithRoom.length) {
+        // Nếu có ai hợp lệ allowUserForExp thì chọn trong nhóm đó;
+        // nếu không có ai hợp lệ thì vẫn chọn từ poolWithRoom (đảm bảo quota)
+        const allowed = poolWithRoom.filter((i) => allowUserForExp(i, expRaw));
+        chosen = pickGlobalByDeficit(allowed.length ? allowed : poolWithRoom);
       }
-      if (allowed.length) {
-        chosen = pickGlobalByDeficit(allowed);
-      } else {
-        // Nới lỏng (cực hiếm): chọn toàn cục để không bỏ job
-        chosen = pickGlobalByDeficit();
-      }
+    }
+
+    // 3B) Pha 2: Mọi người đã đủ quota -> overflow tối thiểu, ưu tiên "ít vượt" và hợp lệ allowUserForExp
+    if (chosen == null) {
+      const allowedAll: number[] = [];
+      for (let i = 0; i < active.length; i++)
+        if (allowUserForExp(i, expRaw)) allowedAll.push(i);
+      chosen = pickGlobalByDeficit(allowedAll.length ? allowedAll : undefined);
     }
 
     // Gán
@@ -555,24 +534,23 @@ function allocatePreferWarehousesTwoPhase(
       taskIndex: rIdx,
     });
     assignedCount[chosen!] += 1;
-    deficitLive[chosen!] -= 1; // có thể âm khi vượt quota theo rule
+    deficitLive[chosen!] -= 1;
 
-    // Ghi owner lần đầu của block voucher
+    // Ghi owner lần đầu của block voucher + ST
     if (vKey && currentVoucherOwner == null) currentVoucherOwner = chosen!;
-    // Ghi owner ST lần đầu
     if (stVal && !stOwner.has(stVal)) stOwner.set(stVal, chosen!);
 
-    // Cập nhật "mã kho ngoại" đã dùng nếu job KHÔNG khớp kho
-    if (expKey !== "__NO_EXPORT__" && !isMatched(chosen!, expRaw)) {
-      foreignExports[chosen!].add(expKey);
+    // Đánh dấu "kho ngoại" đã dùng nếu job KHÔNG khớp kho
+    if (expRaw != null && !isMatched(chosen!, expRaw)) {
+      const expKey = normExpKey(expRaw);
+      if (expKey !== "__NO_EXPORT__") foreignExports[chosen!].add(expKey);
     }
   }
 
-  // ===== Tổng kết summary cho TOÀN BỘ users (kể cả offline) =====
+  // ==== Tổng kết ====
   const countMap = new Map<string, number>();
-  for (let i = 0; i < active.length; i++) {
+  for (let i = 0; i < active.length; i++)
     countMap.set(active[i].code, assignedCount[i]);
-  }
 
   const summary: AllocationSummary[] = users.map((u) => ({
     userCode: u.code,
