@@ -61,7 +61,13 @@ import {
   reorderUsersByDeficit,
   settleDayAndGetAgg,
 } from "./service/monthStats";
-import type { AllocationSummary, AssignmentItem, TaskRow, User } from "./type";
+import type {
+  AllocationSummary,
+  AllocOpts,
+  AssignmentItem,
+  TaskRow,
+  User,
+} from "./type";
 import { HolderOutlined } from "@ant-design/icons";
 import { CSS } from "@dnd-kit/utilities";
 import {
@@ -228,16 +234,30 @@ function detectGroupKeys(headers: string[]) {
   const find = (hints: string[]) =>
     headers.find((h) => hints.some((t) => toKey(h).includes(t)));
 
-  const voucherKey = find(["ma chung tu", "so ct", "chung tu", "ct"]);
+  const voucherKey = find([
+    "ma chung tu",
+    "so ct",
+    "chung tu",
+    "ct",
+    "voucher",
+  ]);
+  const exportKey = find([
+    "ma noi xuat",
+    "noi xuat",
+    "kho xuat",
+    "store xuat",
+    "export",
+  ]);
   const receiveKey = find([
     "ma noi nhan",
     "noi nhan",
     "kho nhan",
     "store nhan",
+    "receive",
   ]);
-  const exportKey = find(["ma noi xuat", "noi xuat", "kho xuat", "store xuat"]);
+  const stKey = find(["ma st", "st"]);
 
-  return { voucherKey, receiveKey, exportKey };
+  return { voucherKey, exportKey, receiveKey, stKey };
 }
 
 function sortRowsByGroupKeys(rows: TaskRow[], keys: string[]) {
@@ -283,9 +303,29 @@ function hasWarehouse(u: User, exportCode: unknown) {
 function allocatePreferWarehousesTwoPhase(
   users: User[],
   rows: TaskRow[],
-  exportKey: string | null
+  arg3: string | null | AllocOpts,
+  arg4?: string | null,
+  arg5?: string | null
 ): { summary: AllocationSummary[]; assignments: AssignmentItem[] } {
+  // Chuẩn hoá tham số -> AllocOpts
+  const opts: AllocOpts =
+    typeof arg3 === "object" && arg3 !== null
+      ? {
+          exportKey: arg3.exportKey ?? null,
+          voucherKey: arg3.voucherKey ?? null,
+          stKey: arg3.stKey ?? null,
+        }
+      : {
+          exportKey: (arg3 as string | null) ?? null,
+          voucherKey: arg4 ?? null,
+          stKey: arg5 ?? null,
+        };
+
+  const { exportKey, voucherKey, stKey } = opts;
+
+  // Chỉ lấy user đang online & weight > 0 để phân
   const active = users.filter((u) => u.online && u.weightPct > 0);
+
   if (!rows.length || !active.length) {
     return {
       summary: users.map((u) => ({
@@ -299,112 +339,242 @@ function allocatePreferWarehousesTwoPhase(
     };
   }
 
+  // ===== Tính quota theo trọng số (Largest Remainder / Hamilton) =====
   const N = rows.length;
   const totalW = active.reduce((s, u) => s + u.weightPct, 0);
 
-  // quota mục tiêu
-  const base = active.map((u) => Math.floor((N * u.weightPct) / totalW));
-  const baseSum = base.reduce((s, x) => s + x, 0);
-  const remainder = N - baseSum;
-  const quota = base.slice();
-  for (let i = 0; i < remainder; i++) quota[i % active.length] += 1;
+  let quota: number[];
+  if (totalW <= 0) {
+    const even = Math.floor(N / active.length);
+    const remEven = N - even * active.length;
+    quota = active.map(() => even);
+    for (let i = 0; i < remEven; i++) quota[i] += 1;
+  } else {
+    const shares = active.map((u) => (N * u.weightPct) / totalW);
+    const base = shares.map((x) => Math.floor(x));
+    const fracs = shares.map((x, i) => x - base[i]);
+    const baseSum = base.reduce((s, x) => s + x, 0);
+    const remLR = N - baseSum;
+
+    const idxs = fracs
+      .map((f, i) => ({ i, f }))
+      .sort((a, b) => (b.f === a.f ? a.i - b.i : b.f - a.f));
+
+    quota = base.slice();
+    for (let k = 0; k < remLR; k++) quota[idxs[k].i] += 1;
+  }
 
   const assignments: AssignmentItem[] = [];
   const assignedCount = new Array(active.length).fill(0);
+  const deficitLive = quota.slice(); // >0 còn room; 0 đủ; <0 đã vượt
 
-  // Sử dụng deficit "sống" ngay từ Pha A
-  const deficitLive = quota.slice(); // còn room mỗi user
-  const unassignedRowIdx: number[] = [];
+  // ===== Giới hạn số mã kho "ngoại" theo TỪNG USER =====
+  // Rule: weightPct >= 100 -> tối đa 2 mã kho "ngoại"; weightPct < 100 -> tối đa 1
+  const foreignLimit: number[] = active.map((u) =>
+    u.weightPct >= 100 ? 2 : 1
+  );
+  const foreignExports: Array<Set<string>> = active.map(
+    () => new Set<string>()
+  );
 
-  // round-robin theo từng mã nơi xuất (chỉ xoay trong nhóm KHỚP-KHO còn room)
-  const perExportCursor = new Map<string, number>();
-  const pickInMatchesRR = (
-    indices: number[],
-    expKey: string
-  ): number | null => {
-    if (!indices.length) return null;
-    const cur = perExportCursor.get(expKey) ?? 0;
-    // quay 1 vòng tìm user còn room
-    for (let k = 0; k < indices.length; k++) {
-      const j = indices[(cur + k) % indices.length];
-      if (deficitLive[j] > 0) {
-        perExportCursor.set(expKey, (cur + k + 1) % indices.length);
-        return j;
-      }
-    }
-    return null; // không ai còn room
+  const isMatched = (i: number, expRaw: unknown) =>
+    hasWarehouse(active[i], expRaw);
+
+  const normExpKey = (expRaw: unknown) => {
+    const { raw } = normForCompare(expRaw);
+    return raw || "__NO_EXPORT__";
   };
 
-  // —— PHA A: chỉ gán cho user KHỚP-KHO **còn thiếu** ——
-  for (let i = 0; i < N; i++) {
-    const exportCell = exportKey ? rows[i]?.[exportKey] : undefined;
-    const { raw: expRaw } = normForCompare(exportCell);
-    const expKey = expRaw || "__NO_EXPORT__";
+  const allowUserForExp = (i: number, expRaw: unknown) => {
+    const expKey = normExpKey(expRaw);
+    if (expKey === "__NO_EXPORT__") return true; // không ràng buộc khi thiếu mã nơi xuất
+    if (isMatched(i, expRaw)) return true; // khớp kho -> luôn OK
 
-    let chosen: number | null = null;
-    if (exportKey && exportCell != null) {
-      const matchIndices: number[] = [];
-      for (let j = 0; j < active.length; j++) {
-        if (hasWarehouse(active[j], exportCell)) matchIndices.push(j);
-      }
-      chosen = pickInMatchesRR(matchIndices, expKey); // chỉ chọn nếu còn room
-    }
+    const used = foreignExports[i];
+    if (used.has(expKey)) return true; // đã có mã này rồi -> OK
+    return used.size < foreignLimit[i]; // còn slot "ngoại" cho user i?
+  };
 
-    if (chosen != null) {
-      const holder = active[chosen];
-      assignments.push({
-        userCode: holder.code,
-        userName: holder.name,
-        taskIndex: i,
-      });
-      assignedCount[chosen] += 1;
-      deficitLive[chosen] -= 1; // room giảm đi
-    } else {
-      // chưa gán ở Pha A -> để Pha B xử lý theo thiếu–đủ
-      unassignedRowIdx.push(i);
-    }
-  }
-
-  // —— PHA B: rải phần còn lại theo thiếu–đủ (deficitLive) rồi RR ——
-  let globalCursor = 0;
-  const pickByDeficitThenRR = (): number => {
-    let bestIdx = -1,
-      bestDef = -Infinity;
-    for (let walked = 0; walked < active.length; walked++) {
-      const idx = (globalCursor + walked) % active.length;
-      const d = deficitLive[idx];
-      if (d > bestDef) {
-        bestDef = d;
-        bestIdx = idx;
-      }
-    }
-    if (bestDef > 0) {
-      globalCursor = (bestIdx + 1) % active.length;
-      return bestIdx;
-    }
-    // hết room → spillover vòng tròn
-    const idx = globalCursor;
-    globalCursor = (globalCursor + 1) % active.length;
+  // ===== Helpers =====
+  const perExportCursor = new Map<string, number>();
+  const nextRR = (key: string, pool: number[]) => {
+    if (!pool.length) return null;
+    const cur = perExportCursor.get(key) ?? 0;
+    const idx = pool[cur % pool.length];
+    perExportCursor.set(key, (cur + 1) % pool.length);
     return idx;
   };
 
-  for (const rowIdx of unassignedRowIdx) {
-    const chosen = pickByDeficitThenRR();
-    const holder = active[chosen];
+  const pickByDeficit = (pool: number[]) => {
+    let best = -1;
+    let bestDef = -Infinity;
+    for (const i of pool) {
+      const d = deficitLive[i];
+      if (d > bestDef) {
+        bestDef = d;
+        best = i;
+      }
+    }
+    return best;
+  };
+
+  const pickGlobalByDeficit = (candidates?: number[]) => {
+    const pool = candidates ?? [...Array(active.length).keys()];
+    const withRoom = pool.filter((i) => deficitLive[i] > 0);
+    if (withRoom.length) return pickByDeficit(withRoom);
+
+    let best = pool[0];
+    let bestDef = -Infinity;
+    for (const i of pool) {
+      const d = deficitLive[i];
+      if (d > bestDef) {
+        bestDef = d;
+        best = i;
+      }
+    }
+    return best;
+  };
+
+  // ===== Chính sách dính voucher theo block liên tiếp =====
+  const VOUCHER_OVERFLOW_LIMIT = 1;
+  let currentVoucher = "";
+  let currentVoucherOwner: number | null = null;
+  let currentVoucherOverflowUsed = 0;
+
+  // ST ưu tiên (không vượt quota)
+  const stOwner = new Map<string, number>();
+
+  // ===== Giới hạn overflow theo nơi xuất (per export & per user) =====
+  const EXPORT_OVERFLOW_LIMIT = 1;
+  const exportOverflowUsed = new Map<string, Map<number, number>>();
+  const incExportOverflow = (expKey: string, idx: number) => {
+    let inner = exportOverflowUsed.get(expKey);
+    if (!inner) {
+      inner = new Map<number, number>();
+      exportOverflowUsed.set(expKey, inner);
+    }
+    inner.set(idx, (inner.get(idx) ?? 0) + 1);
+  };
+  const canExportOverflow = (expKey: string, idx: number) => {
+    const inner = exportOverflowUsed.get(expKey);
+    return (inner?.get(idx) ?? 0) < EXPORT_OVERFLOW_LIMIT;
+  };
+
+  for (let rIdx = 0; rIdx < N; rIdx++) {
+    const row = rows[rIdx];
+
+    // Chuẩn hoá keys
+    const expRaw = exportKey ? row[exportKey] : undefined;
+    const expKey = normExpKey(expRaw);
+
+    const vRaw = voucherKey ? String(row[voucherKey] ?? "").trim() : "";
+    const vKey = vRaw ? normCode(vRaw) : "";
+
+    const stRaw = stKey ? String(row[stKey] ?? "").trim() : "";
+    const stVal = stRaw ? normCode(stRaw) : "";
+
+    // Reset block voucher khi đổi mã
+    if (vKey !== currentVoucher) {
+      currentVoucher = vKey;
+      currentVoucherOwner = null;
+      currentVoucherOverflowUsed = 0;
+    }
+
+    // Pool ôm kho (khớp export với user.warehouses)
+    const matched: number[] = [];
+    if (expRaw != null) {
+      for (let i = 0; i < active.length; i++) {
+        if (hasWarehouse(active[i], expRaw)) matched.push(i);
+      }
+    }
+
+    let chosen: number | null = null;
+
+    // 0) Dính voucher owner nếu có (và hợp lệ theo allowUserForExp)
+    if (vKey && currentVoucherOwner != null) {
+      const owner: number = currentVoucherOwner;
+      if (allowUserForExp(owner, expRaw)) {
+        if (deficitLive[owner] > 0) {
+          chosen = owner;
+        } else if (currentVoucherOverflowUsed < VOUCHER_OVERFLOW_LIMIT) {
+          chosen = owner;
+          currentVoucherOverflowUsed += 1;
+        }
+      }
+    }
+
+    // 1) Ưu tiên pool ôm kho
+    if (chosen == null && matched.length) {
+      const bestRoom = matched.filter((i) => deficitLive[i] > 0);
+      if (bestRoom.length) {
+        const bestByDef = pickByDeficit(bestRoom);
+        const tie = bestRoom.filter(
+          (i) => deficitLive[i] === deficitLive[bestByDef]
+        );
+        chosen =
+          tie.length > 1 ? (nextRR(`EXP_${expKey}`, tie) as number) : bestByDef;
+      } else {
+        // hết room -> overflow theo export, đồng thời phải hợp lệ theo giới hạn "ngoại"
+        const overflowCandidates = matched
+          .filter((i) => canExportOverflow(expKey, i))
+          .filter((i) => allowUserForExp(i, expRaw));
+        if (overflowCandidates.length) {
+          chosen = nextRR(`EXP_${expKey}`, overflowCandidates) as number;
+          incExportOverflow(expKey, chosen);
+        }
+      }
+    }
+
+    // 2) ST owner nếu còn room & hợp lệ theo ràng buộc "ngoại"
+    if (chosen == null && stVal && stOwner.has(stVal)) {
+      const stIdx = stOwner.get(stVal)!;
+      if (deficitLive[stIdx] > 0 && allowUserForExp(stIdx, expRaw)) {
+        chosen = stIdx;
+      }
+    }
+
+    // 3) Toàn cục: chỉ xét người hợp lệ theo allowUserForExp
+    if (chosen == null) {
+      const allowed: number[] = [];
+      for (let i = 0; i < active.length; i++) {
+        if (allowUserForExp(i, expRaw)) allowed.push(i);
+      }
+      if (allowed.length) {
+        chosen = pickGlobalByDeficit(allowed);
+      } else {
+        // Nới lỏng (cực hiếm): chọn toàn cục để không bỏ job
+        chosen = pickGlobalByDeficit();
+      }
+    }
+
+    // Gán
+    const holder = active[chosen!];
     assignments.push({
       userCode: holder.code,
       userName: holder.name,
-      taskIndex: rowIdx,
+      taskIndex: rIdx,
     });
-    assignedCount[chosen] += 1;
-    deficitLive[chosen] -= 1;
+    assignedCount[chosen!] += 1;
+    deficitLive[chosen!] -= 1; // có thể âm khi vượt quota theo rule
+
+    // Ghi owner lần đầu của block voucher
+    if (vKey && currentVoucherOwner == null) currentVoucherOwner = chosen!;
+    // Ghi owner ST lần đầu
+    if (stVal && !stOwner.has(stVal)) stOwner.set(stVal, chosen!);
+
+    // Cập nhật "mã kho ngoại" đã dùng nếu job KHÔNG khớp kho
+    if (expKey !== "__NO_EXPORT__" && !isMatched(chosen!, expRaw)) {
+      foreignExports[chosen!].add(expKey);
+    }
   }
 
+  // ===== Tổng kết summary cho TOÀN BỘ users (kể cả offline) =====
   const countMap = new Map<string, number>();
-  for (let k = 0; k < active.length; k++)
-    countMap.set(active[k].code, assignedCount[k]);
+  for (let i = 0; i < active.length; i++) {
+    countMap.set(active[i].code, assignedCount[i]);
+  }
 
-  const summary = users.map((u) => ({
+  const summary: AllocationSummary[] = users.map((u) => ({
     userCode: u.code,
     userName: u.name,
     weightPct: u.weightPct,
@@ -421,7 +591,11 @@ function exportExcelWithAssignments(
   taskRows: TaskRow[],
   taskHeaders: string[],
   summary: AllocationSummary[],
-  exportKey: string | null // NEW
+  opts: {
+    exportKey: string | null;
+    voucherKey: string | null;
+    stKey: string | null;
+  }
 ) {
   if (!summary.length) {
     message.warning("Chưa có kết quả để xuất.");
@@ -431,8 +605,9 @@ function exportExcelWithAssignments(
   const { assignments } = allocatePreferWarehousesTwoPhase(
     users,
     taskRows,
-    exportKey
+    opts
   );
+
   const assignedMap = new Map<number, { code: string; name: string }>();
   assignments.forEach((a) =>
     assignedMap.set(a.taskIndex, { code: a.userCode, name: a.userName })
@@ -489,6 +664,9 @@ export default function App() {
   const [view, setView] = useState<"assign" | "stats">("assign");
   const [exportKey, setExportKey] = useState<string | null>(null);
   const [showTour, setShowTour] = useState(false);
+  const [voucherKey, setVoucherKey] = useState<string | null>(null);
+  const [stKey, setStKey] = useState<string | null>(null);
+  const [testMode, setTestMode] = useState<boolean>(false);
 
   const refUpload = useRef<HTMLDivElement | null>(null);
   const refAllocateBtn = useRef<HTMLButtonElement | null>(null);
@@ -872,15 +1050,20 @@ export default function App() {
   const handleTasksFile = async (file: File) => {
     try {
       const { rows, headers } = await parseTasksExcel(file);
-      const { voucherKey, receiveKey, exportKey } = detectGroupKeys(headers);
-      const keyOrder = [voucherKey, receiveKey, exportKey].filter(
+      const { voucherKey, exportKey, receiveKey, stKey } =
+        detectGroupKeys(headers);
+
+      // Thứ tự nhóm: Mã chứng từ -> Mã nơi xuất -> Mã nơi nhận
+      const keyOrder = [voucherKey, exportKey, receiveKey].filter(
         Boolean
       ) as string[];
       const sortedRows = sortRowsByGroupKeys(rows, keyOrder);
 
       setTaskRows(sortedRows);
       setTaskHeaders(headers);
-      setExportKey(exportKey ?? null); // NEW
+      setVoucherKey(voucherKey ?? null);
+      setExportKey(exportKey ?? null);
+      setStKey(stKey ?? null);
 
       message.success(`Đã nạp & sắp xếp ${sortedRows.length} dòng công việc.`);
     } catch (e: unknown) {
@@ -898,7 +1081,11 @@ export default function App() {
     const { summary: resultSummary } = allocatePreferWarehousesTwoPhase(
       users,
       taskRows,
-      exportKey ?? null
+      {
+        exportKey: exportKey ?? null,
+        voucherKey: voucherKey ?? null,
+        stKey: stKey ?? null,
+      }
     );
 
     setSummary(resultSummary);
@@ -906,8 +1093,16 @@ export default function App() {
       return message.warning("Không có user online/weight > 0 để phân bổ.");
     }
 
+    // NEW — Test mode: không ghi Firestore, không reorder users
+    if (testMode) {
+      message.success(
+        "Đã phân bổ (Chế độ thử). Không lưu Firestore & không đổi thứ tự NV."
+      );
+      return;
+    }
+
+    // === Nhánh thật: ghi log + settle + reorder như cũ ===
     try {
-      // 1) Lưu entries ngày (như cũ)
       await logAssignmentToday(
         resultSummary.map((s) => ({
           userCode: s.userCode,
@@ -916,17 +1111,15 @@ export default function App() {
         }))
       );
 
-      // 2) NEW: settle ngày -> cập nhật aggregate tháng theo trọng số NGÀY HÔM NAY
       const agg = await settleDayAndGetAgg({
         forDate: new Date(),
-        users, // cần code/online/weightPct hiện tại
+        users,
         summary: resultSummary.map((s) => ({
           userCode: s.userCode,
           count: s.count,
         })),
       });
 
-      // 3) NEW: reorder danh sách cho NGÀY SAU theo deficit tháng
       const reordered = reorderUsersByDeficit(users, agg);
       setUsers(reordered);
       await saveUsersOrdering(reordered.map((u) => u.code));
@@ -1216,6 +1409,34 @@ export default function App() {
 
                       {/* Action row: ưu tiên rõ ràng */}
                       <Row gutter={[8, 8]}>
+                        {import.meta.env.DEV && (
+                          <Col span={24}>
+                            <Space
+                              align="center"
+                              style={{
+                                width: "100%",
+                                justifyContent: "space-between",
+                                padding: "8px 12px",
+                                borderRadius,
+                                border: `1px dashed ${colorPrimary}40`,
+                                background: `${colorPrimary}06`,
+                              }}
+                            >
+                              <Space>
+                                <Switch
+                                  checked={testMode}
+                                  onChange={setTestMode}
+                                />
+                                <Text strong>Chế độ thử (không lưu)</Text>
+                              </Space>
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                Chỉ tính toán & hiển thị kết quả; KHÔNG ghi
+                                Firestore và KHÔNG đổi thứ tự NV
+                              </Text>
+                            </Space>
+                          </Col>
+                        )}
+
                         <Col span={24}>
                           <Button
                             ref={refAllocateBtn}
@@ -1226,7 +1447,7 @@ export default function App() {
                             size="large"
                             style={{ borderRadius, fontWeight: 600 }}
                           >
-                            Phân bổ
+                            {testMode ? "Phân bổ (Chế độ thử)" : "Phân bổ"}
                           </Button>
                         </Col>
 
@@ -1240,7 +1461,11 @@ export default function App() {
                                 taskRows,
                                 taskHeaders,
                                 summary,
-                                exportKey ?? null
+                                {
+                                  exportKey: exportKey ?? null,
+                                  voucherKey: voucherKey ?? null,
+                                  stKey: stKey ?? null,
+                                }
                               )
                             }
                             disabled={!summary.length}

@@ -32,3 +32,9 @@ export type MonthAgg = {
   lastServedAt: Record<string, string>;
   version?: string;
 };
+
+export type AllocOpts = {
+  exportKey: string | null;
+  voucherKey: string | null;
+  stKey: string | null;
+};
