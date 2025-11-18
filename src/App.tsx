@@ -302,8 +302,15 @@ function allocatePreferWarehousesTwoPhase(
 
   const { exportKey, voucherKey } = opts;
 
-  // ===== Active users =====
-  const active = users.filter((u) => u.online && u.weightPct > 0);
+  // ===== Active users (force numeric weights) =====
+  const activeRaw = users.map((u) => ({
+    ...u,
+    weightPct: Number(String(u.weightPct).replace("%", "").trim()) || 0,
+    online: !!u.online,
+    warehouses: Array.isArray(u.warehouses) ? u.warehouses : [],
+  }));
+  const active = activeRaw.filter((u) => u.online && u.weightPct > 0);
+
   if (!rows.length || !active.length) {
     return {
       summary: users.map((u) => ({
@@ -321,7 +328,6 @@ function allocatePreferWarehousesTwoPhase(
   const N = rows.length;
   const totalW = active.reduce((s, u) => s + u.weightPct, 0);
   let quota: number[];
-
   if (totalW <= 0) {
     const even = Math.floor(N / active.length);
     const rem = N - even * active.length;
@@ -339,138 +345,121 @@ function allocatePreferWarehousesTwoPhase(
     quota = base.slice();
     for (let k = 0; k < rem; k++) quota[idxs[k].i] += 1;
   }
-
-  // Cap CHẶT, rescue cho phép +1 dòng tối đa nếu cần (block nguyên)
   const hardCap = quota.slice();
-  const MAX_OVERSHOOT_ROWS = 1;
 
-  // ====== GIỚI HẠN MÃ NGOẠI KHO THEO DISTINCT ======
-  const FOREIGN_LIMIT_DISTINCT = 2; // TỐI ĐA 2 MÃ NƠI XUẤT ngoại kho phân biệt / user
+  // ===== GIỮ: giới hạn ngoại kho, escalation 2→3→4 =====
+  const FOREIGN_LIMIT_BASE = 2;
 
-  // ===== State sống =====
+  // ===== State =====
   const assignments: AssignmentItem[] = [];
   const assignedCount = new Array(active.length).fill(0);
-  const deficitLive = quota.slice(); // >0 còn room; 0 đủ; <0 đã vượt
+  const deficitLive = quota.slice();
   const orderRank: number[] = active.map((_u, idx) => idx);
-
-  // Theo dõi các MÃ NƠI XUẤT NGOẠI KHO (distinct) đã cấp cho từng user
   const foreignExportSets: Array<Set<string>> = active.map(
     () => new Set<string>()
   );
 
   // ===== Helpers =====
-  const normForCompare = (v: unknown) => {
-    const s = normCode(String(v ?? "")).trim();
-    const noZeros = s.replace(/^0+/, "");
-    return { raw: s, noZeros };
+  const normCodeLike = (v: unknown) => {
+    const s = String(v ?? "")
+      .normalize("NFKC")
+      .replace(/\p{Diacritic}/gu, "")
+      .trim()
+      .toUpperCase()
+      .replace(/^0+/, "");
+    return s;
   };
-  const normExpKey = (expRaw: unknown) => {
-    const { raw } = normForCompare(expRaw);
-    return raw || "__NO_EXPORT__";
+  const expKeyOf = (expRaw: unknown) => {
+    const s = normCodeLike(expRaw);
+    return s || "__NO_EXPORT__";
   };
-  const isMatchedExpSingle = (iUser: number, expRaw: unknown) => {
-    const { raw: exp, noZeros: expNZ } = normForCompare(expRaw);
+  const isOwner = (iUser: number, expRaw: unknown) => {
+    const exp = normCodeLike(expRaw);
+    if (!exp) return true; // không có mã xuất => ai cũng coi như owner
     const ws = Array.isArray(active[iUser].warehouses)
       ? active[iUser].warehouses
       : [];
     for (const w of ws) {
-      const { raw: wRaw, noZeros: wNZ } = normForCompare(w);
-      if (
-        exp &&
-        (exp === wRaw || exp === wNZ || expNZ === wRaw || expNZ === wNZ)
-      )
-        return true;
+      if (exp === normCodeLike(w)) return true;
     }
     return false;
   };
-
-  // Với một block (tập expKeys), trả về TẬP các mã ngoại kho mới sẽ phát sinh nếu gán cho iUser
   const foreignNewKeysFor = (iUser: number, expKeys: Set<string>) => {
     const newly = new Set<string>();
     for (const ek of expKeys) {
       if (ek === "__NO_EXPORT__") continue;
-      if (!isMatchedExpSingle(iUser, ek)) {
-        // chỉ tính là "ngoại" khi không khớp bất kỳ mã kho user đang nắm
-        if (!foreignExportSets[iUser].has(ek)) newly.add(ek);
-      }
+      if (!isOwner(iUser, ek) && !foreignExportSets[iUser].has(ek))
+        newly.add(ek);
     }
     return newly;
   };
-
   const underCap = (i: number, blockSize: number) =>
     assignedCount[i] + blockSize <= hardCap[i];
-  const canRescue = (i: number, blockSize: number) => {
-    const overshoot = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
-    return overshoot <= Math.max(MAX_OVERSHOOT_ROWS, 0);
-  };
 
-  const pickByDeficit = (pool: number[]) => {
+  // pickBalanced: deficitLive desc, util(today) asc, orderRank asc
+  const pickBalanced = (pool: number[]) => {
     let best = -1;
-    let bestDef = -Infinity;
+    let bestKey: number[] = [];
     for (const i of pool) {
-      const d = deficitLive[i];
-      if (d > bestDef) {
-        bestDef = d;
+      const deficit = deficitLive[i];
+      const util = assignedCount[i] / Math.max(1, hardCap[i]);
+      const tie = -orderRank[i];
+      const key = [deficit, -util, tie];
+      if (
+        best === -1 ||
+        key[0] > bestKey[0] ||
+        (key[0] === bestKey[0] &&
+          (key[1] > bestKey[1] ||
+            (key[1] === bestKey[1] && key[2] > bestKey[2])))
+      ) {
         best = i;
-      } else if (d === bestDef && best !== -1) {
-        if (orderRank[i] < orderRank[best]) best = i;
+        bestKey = key;
       }
     }
     return best;
   };
 
-  // ===== Nhóm theo voucher =====
+  // ======= NHÓM THEO (VOUCHER, EXPORT) =======
   type Group = {
     vKey: string;
+    eKey: string;
     idxs: number[];
     firstIdx: number;
     expKeys: Set<string>;
     owners: number[];
   };
-  const groups: Group[] = [];
-  const indexByV: Map<string, number> = new Map();
 
+  const groupsMap = new Map<string, Group>(); // key = vKey + '|' + eKey
   const getVKey = (i: number) => {
     if (!voucherKey) return `__ROW_${i}`;
     const vRaw = String(rows[i][voucherKey] ?? "").trim();
-    return vRaw ? normCode(vRaw) : `__ROW_${i}`;
+    return vRaw ? normCodeLike(vRaw) : `__ROW_${i}`;
   };
 
   for (let i = 0; i < rows.length; i++) {
-    const vKey = getVKey(i);
-    if (!indexByV.has(vKey)) {
-      indexByV.set(vKey, groups.length);
-      groups.push({
-        vKey,
+    const v = getVKey(i);
+    const e = exportKey ? expKeyOf(rows[i][exportKey]) : "__NO_EXPORT__";
+    const key = `${v}|${e}`;
+    if (!groupsMap.has(key)) {
+      groupsMap.set(key, {
+        vKey: v,
+        eKey: e,
         idxs: [i],
         firstIdx: i,
-        expKeys: new Set(),
+        expKeys: new Set([e]),
         owners: [],
       });
     } else {
-      groups[indexByV.get(vKey)!].idxs.push(i);
+      groupsMap.get(key)!.idxs.push(i);
     }
   }
+  const groups = Array.from(groupsMap.values());
 
-  // Tập exp keys + owners (user khớp ÍT NHẤT 1 mã trong block)
+  // Tính owners theo eKey (một exp duy nhất/nhóm)
   for (const g of groups) {
-    if (exportKey) {
-      for (const rIdx of g.idxs)
-        g.expKeys.add(normExpKey(rows[rIdx][exportKey]));
-    } else {
-      g.expKeys.add("__NO_EXPORT__");
-    }
     const owners: number[] = [];
-    for (let i = 0; i < active.length; i++) {
-      let ok = false;
-      for (const ek of g.expKeys) {
-        if (ek === "__NO_EXPORT__" || isMatchedExpSingle(i, ek)) {
-          ok = true;
-          break;
-        }
-      }
-      if (ok) owners.push(i);
-    }
+    for (let i = 0; i < active.length; i++)
+      if (isOwner(i, g.eKey)) owners.push(i);
     g.owners = owners;
   }
 
@@ -479,146 +468,340 @@ function allocatePreferWarehousesTwoPhase(
     (a, b) => b.idxs.length - a.idxs.length || a.firstIdx - b.firstIdx
   );
 
-  // ===== 3 PHA =====
+  // ===== các filter dùng trong nhiều pha =====
+  const filterCapAndForeign = (
+    pool: number[],
+    g: Group,
+    blockSize: number,
+    limitDistinct: number
+  ) => {
+    const out: number[] = [];
+    for (const i of pool) {
+      if (!underCap(i, blockSize)) continue;
+      const addKeys = foreignNewKeysFor(i, g.expKeys);
+      if (foreignExportSets[i].size + addKeys.size <= limitDistinct)
+        out.push(i);
+    }
+    return out;
+  };
+  const filterForeignOnly = (
+    pool: number[],
+    g: Group,
+    limitDistinct: number
+  ) => {
+    const out: number[] = [];
+    for (const i of pool) {
+      const addKeys = foreignNewKeysFor(i, g.expKeys);
+      if (foreignExportSets[i].size + addKeys.size <= limitDistinct)
+        out.push(i);
+    }
+    return out;
+  };
+
+  // ===== PHA CHÍNH: limit=2, ưu tiên OWNER tuyệt đối trước khi xét non-owner =====
+  const leftovers: Group[] = [];
   for (const g of groups) {
     const blockSize = g.idxs.length;
     const allIdx = [...Array(active.length).keys()];
 
-    // Helper: lọc theo cap & giới hạn DISTINCT ngoại kho
-    const filterByLimits = (pool: number[], needUnderCap: boolean) => {
-      const out: number[] = [];
-      for (const i of pool) {
-        if (needUnderCap && !underCap(i, blockSize)) continue;
-
-        // Kiểm tra số MÃ ngoại kho MỚI nếu gán block này
-        const newForeign = foreignNewKeysFor(i, g.expKeys);
-        const newCount = newForeign.size;
-        // tổng sau khi gán
-        const totalForeignAfter = foreignExportSets[i].size + newCount;
-        if (totalForeignAfter <= FOREIGN_LIMIT_DISTINCT) {
-          out.push(i);
-        }
-      }
-      return out;
-    };
-
-    // — PHA A: Owner + dưới cap + không vượt limit distinct ngoại kho
-    {
-      const cand = filterByLimits(g.owners, true);
-      if (cand.length) {
-        const owner = pickByDeficit(cand);
-        // gán
-        for (const rIdx of g.idxs) {
-          assignments.push({
-            userCode: active[owner].code,
-            userName: active[owner].name,
-            taskIndex: rIdx,
-          });
-        }
-        assignedCount[owner] += blockSize;
-        deficitLive[owner] -= blockSize;
-        // cập nhật foreign set
-        const addKeys = foreignNewKeysFor(owner, g.expKeys);
-        addKeys.forEach((k) => foreignExportSets[owner].add(k));
-        continue;
-      }
-    }
-
-    // — PHA B: Bất kỳ user dưới cap + không vượt limit distinct ngoại kho
-    {
-      const candUnderCap = filterByLimits(allIdx, true);
-      if (candUnderCap.length) {
-        const owner = pickByDeficit(candUnderCap);
-        for (const rIdx of g.idxs) {
-          assignments.push({
-            userCode: active[owner].code,
-            userName: active[owner].name,
-            taskIndex: rIdx,
-          });
-        }
-        assignedCount[owner] += blockSize;
-        deficitLive[owner] -= blockSize;
-        const addKeys = foreignNewKeysFor(owner, g.expKeys);
-        addKeys.forEach((k) => foreignExportSets[owner].add(k));
-        continue;
-      }
-    }
-
-    // — PHA C: Rescue (cho vượt cap ít nhất) **nhưng vẫn KHÔNG vượt limit distinct ngoại kho**
-    {
-      let best = -1;
-      let bestOvershoot = Infinity;
-      let bestDef = -Infinity;
-
-      for (const i of allIdx) {
-        // Giới hạn ngoại kho distinct: vẫn phải thỏa
-        const addKeys = foreignNewKeysFor(i, g.expKeys);
-        if (foreignExportSets[i].size + addKeys.size > FOREIGN_LIMIT_DISTINCT) {
-          continue;
-        }
-
-        const overshoot = Math.max(
-          0,
-          assignedCount[i] + blockSize - hardCap[i]
-        );
-        if (
-          overshoot < bestOvershoot ||
-          (overshoot === bestOvershoot && deficitLive[i] > bestDef) ||
-          (overshoot === bestOvershoot &&
-            deficitLive[i] === bestDef &&
-            orderRank[i] < (best === -1 ? 1e9 : orderRank[best]))
-        ) {
-          best = i;
-          bestOvershoot = overshoot;
-          bestDef = deficitLive[i];
-        }
-      }
-
-      if (best === -1) {
-        // trường hợp cực đoan: không ai thỏa limit distinct → chọn người có foreign set nhỏ nhất, rồi ít vượt nhất
-        let alt = -1,
-          bestSize = Infinity,
-          bestOver = Infinity,
-          bestDf = -Infinity;
-        for (let i = 0; i < active.length; i++) {
-          const over = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
-          const size = foreignExportSets[i].size;
-          if (
-            size < bestSize ||
-            (size === bestSize && over < bestOver) ||
-            (size === bestSize &&
-              over === bestOver &&
-              deficitLive[i] > bestDf) ||
-            (size === bestSize &&
-              over === bestOver &&
-              deficitLive[i] === bestDf &&
-              orderRank[i] < (alt === -1 ? 1e9 : orderRank[alt]))
-          ) {
-            alt = i;
-            bestSize = size;
-            bestOver = over;
-            bestDf = deficitLive[i];
-          }
-        }
-        best = alt === -1 ? 0 : alt;
-      }
-
-      // Nếu vẫn vượt cap quá lớn và có lựa chọn khác? (ở đây đã chọn ít vượt nhất rồi)
-      if (!canRescue(best, blockSize)) {
-        // Tuyệt đối hiếm khi vào đây vì đã chọn overshoot nhỏ nhất; vẫn cứ gán để không kẹt block.
-      }
-
-      for (const rIdx of g.idxs) {
+    // A1: OWNER underCap + foreign<=2
+    let cand = filterCapAndForeign(g.owners, g, blockSize, FOREIGN_LIMIT_BASE);
+    if (cand.length) {
+      const owner = pickBalanced(cand);
+      for (const rIdx of g.idxs)
         assignments.push({
-          userCode: active[best].code,
-          userName: active[best].name,
+          userCode: active[owner].code,
+          userName: active[owner].name,
           taskIndex: rIdx,
         });
+      assignedCount[owner] += blockSize;
+      deficitLive[owner] -= blockSize;
+      const addKeys = foreignNewKeysFor(owner, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[owner].add(k));
+      continue;
+    }
+
+    // A2: KHÔNG có owner còn cap → non-owner underCap + foreign<=2
+    cand = filterCapAndForeign(
+      allIdx.filter((i) => !g.owners.includes(i)),
+      g,
+      blockSize,
+      FOREIGN_LIMIT_BASE
+    );
+    if (cand.length) {
+      const pick = pickBalanced(cand);
+      for (const rIdx of g.idxs)
+        assignments.push({
+          userCode: active[pick].code,
+          userName: active[pick].name,
+          taskIndex: rIdx,
+        });
+      assignedCount[pick] += blockSize;
+      deficitLive[pick] -= blockSize;
+      const addKeys = foreignNewKeysFor(pick, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[pick].add(k));
+      continue;
+    }
+
+    // để lại escalation
+    leftovers.push(g);
+  }
+
+  // ===== LEFTOVERS (limit=2) – overshoot có kiểm soát: 100% có thể overshoot 1 block tổng
+  const overshootBudgetBase = active.map((u) => (u.weightPct >= 100 ? 1 : 0));
+  const canOverWith = (budgetArr: number[], iUser: number, blockSize: number) =>
+    budgetArr[iUser] >= blockSize;
+  const weightSortedIdx = [...Array(active.length).keys()].sort(
+    (i, j) =>
+      active[j].weightPct - active[i].weightPct ||
+      deficitLive[j] - deficitLive[i] ||
+      orderRank[i] - orderRank[j]
+  );
+
+  const stillLeft: Group[] = [];
+  for (const g of leftovers) {
+    const blockSize = g.idxs.length;
+
+    // L1: OWNER underCap (limit=2) — thử lại lần nữa
+    let pool = filterCapAndForeign(g.owners, g, blockSize, FOREIGN_LIMIT_BASE);
+    if (pool.length) {
+      const owner = pickBalanced(pool);
+      for (const rIdx of g.idxs)
+        assignments.push({
+          userCode: active[owner].code,
+          userName: active[owner].name,
+          taskIndex: rIdx,
+        });
+      assignedCount[owner] += blockSize;
+      deficitLive[owner] -= blockSize;
+      const addKeys = foreignNewKeysFor(owner, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[owner].add(k));
+      continue;
+    }
+
+    // L2: OWNER overshoot có kiểm soát (limit=2): 50% không overshoot, ≥100% dùng budget 1 block
+    pool = filterForeignOnly(g.owners, g, FOREIGN_LIMIT_BASE).concat(
+      filterForeignOnly(
+        weightSortedIdx.filter((i) => !g.owners.includes(i)),
+        g,
+        FOREIGN_LIMIT_BASE
+      )
+    );
+    let chosen = -1;
+    for (const i of pool) {
+      const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
+      if (needOver === 0) {
+        chosen = i;
+        break;
       }
-      assignedCount[best] += blockSize;
-      deficitLive[best] -= blockSize;
-      const addKeys = foreignNewKeysFor(best, g.expKeys);
-      addKeys.forEach((k) => foreignExportSets[best].add(k));
+      if (
+        active[i].weightPct >= 100 &&
+        canOverWith(overshootBudgetBase, i, blockSize)
+      ) {
+        chosen = i;
+        break;
+      }
+    }
+    if (chosen !== -1) {
+      const needOver = Math.max(
+        0,
+        assignedCount[chosen] + blockSize - hardCap[chosen]
+      );
+      if (needOver > 0) overshootBudgetBase[chosen] -= blockSize;
+      for (const rIdx of g.idxs)
+        assignments.push({
+          userCode: active[chosen].code,
+          userName: active[chosen].name,
+          taskIndex: rIdx,
+        });
+      assignedCount[chosen] += blockSize;
+      deficitLive[chosen] -= blockSize;
+      const addKeys = foreignNewKeysFor(chosen, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+      continue;
+    }
+
+    // L3: không xong ở limit=2 -> để escalation
+    stillLeft.push(g);
+  }
+
+  // ===== Escalation: thử limit=3 rồi 4 (vẫn ưu tiên OWNER trước)
+  // Không tăng thêm ngân sách overshoot cho nhóm 100% (khóa ở 1 block)
+  const escalateAssign = (groupsIn: Group[], limitDistinct: number) => {
+    if (!groupsIn.length) return [];
+    const budget = overshootBudgetBase.slice(); // KHÔNG cộng thêm
+
+    const notDone: Group[] = [];
+    for (const g of groupsIn) {
+      const blockSize = g.idxs.length;
+
+      // E1: OWNER underCap + foreign<=limit
+      let pool = filterCapAndForeign(g.owners, g, blockSize, limitDistinct);
+      if (pool.length) {
+        const owner = pickBalanced(pool);
+        for (const rIdx of g.idxs)
+          assignments.push({
+            userCode: active[owner].code,
+            userName: active[owner].name,
+            taskIndex: rIdx,
+          });
+        assignedCount[owner] += blockSize;
+        deficitLive[owner] -= blockSize;
+        const addKeys = foreignNewKeysFor(owner, g.expKeys);
+        addKeys.forEach((k) => foreignExportSets[owner].add(k));
+        continue;
+      }
+
+      // E2: OWNER overshoot có kiểm soát (ưu tiên), rồi mới đến non-owner underCap
+      pool = filterForeignOnly(g.owners, g, limitDistinct);
+      let chosen = -1;
+      for (const i of pool) {
+        const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
+        if (needOver === 0) {
+          chosen = i;
+          break;
+        }
+        if (active[i].weightPct >= 100 && budget[i] >= blockSize) {
+          chosen = i;
+          break;
+        }
+      }
+      if (chosen !== -1) {
+        const needOver = Math.max(
+          0,
+          assignedCount[chosen] + blockSize - hardCap[chosen]
+        );
+        if (needOver > 0) budget[chosen] -= blockSize;
+        for (const rIdx of g.idxs)
+          assignments.push({
+            userCode: active[chosen].code,
+            userName: active[chosen].name,
+            taskIndex: rIdx,
+          });
+        assignedCount[chosen] += blockSize;
+        deficitLive[chosen] -= blockSize;
+        const addKeys = foreignNewKeysFor(chosen, g.expKeys);
+        addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+        continue;
+      }
+
+      // E3: non-owner underCap + foreign<=limit
+      pool = filterCapAndForeign(
+        [...Array(active.length).keys()].filter((i) => !g.owners.includes(i)),
+        g,
+        blockSize,
+        limitDistinct
+      );
+      if (pool.length) {
+        const pick = pickBalanced(pool);
+        for (const rIdx of g.idxs)
+          assignments.push({
+            userCode: active[pick].code,
+            userName: active[pick].name,
+            taskIndex: rIdx,
+          });
+        assignedCount[pick] += blockSize;
+        deficitLive[pick] -= blockSize;
+        const addKeys = foreignNewKeysFor(pick, g.expKeys);
+        addKeys.forEach((k) => foreignExportSets[pick].add(k));
+        continue;
+      }
+
+      // E4: non-owner overshoot có kiểm soát (>=100% + còn budget)
+      pool = filterForeignOnly(
+        [...Array(active.length).keys()].filter((i) => !g.owners.includes(i)),
+        g,
+        limitDistinct
+      );
+      chosen = -1;
+      for (const i of pool) {
+        const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
+        if (needOver === 0) {
+          chosen = i;
+          break;
+        }
+        if (active[i].weightPct >= 100 && budget[i] >= blockSize) {
+          chosen = i;
+          break;
+        }
+      }
+      if (chosen !== -1) {
+        const needOver = Math.max(
+          0,
+          assignedCount[chosen] + blockSize - hardCap[chosen]
+        );
+        if (needOver > 0) budget[chosen] -= blockSize;
+        for (const rIdx of g.idxs)
+          assignments.push({
+            userCode: active[chosen].code,
+            userName: active[chosen].name,
+            taskIndex: rIdx,
+          });
+        assignedCount[chosen] += blockSize;
+        deficitLive[chosen] -= blockSize;
+        const addKeys = foreignNewKeysFor(chosen, g.expKeys);
+        addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+      } else {
+        notDone.push(g);
+      }
+    }
+    return notDone;
+  };
+
+  let pending = stillLeft;
+  pending = escalateAssign(pending, 3);
+  pending = escalateAssign(pending, 4);
+
+  // ===== L5: Force-assign — ưu tiên OWNER nhưng chọn cân bằng hơn
+  if (pending.length) {
+    for (const g of pending) {
+      const blockSize = g.idxs.length;
+
+      // ownerFirst: ưu tiên chủ kho trước, rồi mới đến non-owner
+      const ownerFirst = [
+        ...g.owners,
+        ...[...Array(active.length).keys()].filter(
+          (i) => !g.owners.includes(i)
+        ),
+      ];
+
+      const candidates = ownerFirst.slice();
+      const scored = candidates.map((i) => ({
+        i,
+        deficit: deficitLive[i],
+        util: assignedCount[i] / Math.max(1, hardCap[i]),
+        isHundred: active[i].weightPct >= 100,
+      }));
+
+      // 1) Thử người <100% còn underCap
+      let pool = scored.filter(
+        (s) => !s.isHundred && assignedCount[s.i] + blockSize <= hardCap[s.i]
+      );
+
+      if (!pool.length) {
+        // 2) Cho 100% gánh nếu bắt buộc, ưu tiên thiếu nhiều & util thấp
+        pool = scored;
+      }
+
+      pool.sort(
+        (a, b) =>
+          b.deficit - a.deficit ||
+          a.util - b.util ||
+          orderRank[a.i] - orderRank[b.i]
+      );
+
+      const chosen = pool[0]?.i ?? candidates[0];
+
+      for (const rIdx of g.idxs)
+        assignments.push({
+          userCode: active[chosen].code,
+          userName: active[chosen].name,
+          taskIndex: rIdx,
+        });
+      assignedCount[chosen] += blockSize;
+      deficitLive[chosen] -= blockSize;
+      const addKeys = foreignNewKeysFor(chosen, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[chosen].add(k));
     }
   }
 
