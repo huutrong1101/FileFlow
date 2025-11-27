@@ -350,19 +350,22 @@ function allocatePreferWarehousesTwoPhase(
 
   const hardCap = quota.slice();
 
-  // ===== GIỮ: giới hạn ngoại kho, escalation 2→3→4 =====
+  // ===== GIỮ: giới hạn ngoại kho gốc =====
   const FOREIGN_LIMIT_BASE = 2;
 
   // ===== State =====
   const assignments: AssignmentItem[] = [];
   const assignedCount = new Array(active.length).fill(0);
-  const deficitLive = quota.slice();
+  const deficitLive = quota.slice(); // quota còn lại trong ngày
   const orderRank: number[] = active.map((_u, idx) => idx);
   const foreignExportSets: Array<Set<string>> = active.map(
     () => new Set<string>()
   );
 
-  // NEW: anchor non-owner cho từng mã nơi xuất
+  // Rule: mỗi mã nơi xuất chỉ tối đa 2 user "dính" vào
+  const exportUserSet = new Map<string, Set<number>>();
+
+  // Anchor non-owner cho từng mã nơi xuất
   // eKey -> index user trong mảng active
   const exportOverflowOwner = new Map<string, number>();
 
@@ -430,6 +433,85 @@ function allocatePreferWarehousesTwoPhase(
     return best;
   };
 
+  // NEW: per-user limit mã ngoại (đã chỉnh)
+  // - User <100%: luôn max = FOREIGN_LIMIT_BASE (2 mã ngoại)
+  // - User 100%: nới limit dựa trên mức thiếu so với quota (hardCap)
+  const getForeignLimitForUser = (iUser: number, _baseLimit: number) => {
+    const u = active[iUser];
+
+    // Nhóm 50% / <100%: luôn giữ limit cơ bản
+    if (u.weightPct < 100) {
+      return FOREIGN_LIMIT_BASE;
+    }
+
+    const target = hardCap[iUser]; // quota Hamilton cho user này
+    const assigned = assignedCount[iUser];
+    const deficit = target - assigned; // >0 = còn thiếu so với quota
+
+    // Nếu đã đủ hoặc dư quota thì không cần nới thêm ngoại kho
+    if (deficit <= 0) return FOREIGN_LIMIT_BASE;
+
+    // Thiếu càng nhiều thì cho phép thêm càng nhiều mã ngoại kho
+    // (các ngưỡng này có thể chỉnh theo thực tế)
+    if (deficit >= 12) return FOREIGN_LIMIT_BASE + 4; // ví dụ: 2 + 4 = 6 mã ngoại
+    if (deficit >= 8) return FOREIGN_LIMIT_BASE + 3; // 2 + 3 = 5 mã ngoại
+    if (deficit >= 4) return FOREIGN_LIMIT_BASE + 2; // 2 + 2 = 4 mã ngoại
+    return FOREIGN_LIMIT_BASE + 1; // 2 + 1 = 3 mã ngoại
+  };
+
+  // NEW: kiểm tra rule 2-user-per-export (không mutate)
+  const canUseExportForUser = (iUser: number, g: Group) => {
+    const eKey = g.eKey;
+    if (!eKey || eKey === "__NO_EXPORT__") return true;
+    const set = exportUserSet.get(eKey);
+    if (!set) return true;
+    return set.has(iUser) || set.size < 2;
+  };
+
+  // NEW: khi đã CHỌN user cho group → ghi nhận user đó vào exportUserSet
+  const registerExportUser = (iUser: number, g: Group) => {
+    const eKey = g.eKey;
+    if (!eKey || eKey === "__NO_EXPORT__") return;
+    let set = exportUserSet.get(eKey);
+    if (!set) {
+      set = new Set<number>();
+      exportUserSet.set(eKey, set);
+    }
+    set.add(iUser);
+  };
+
+  // NEW: chọn user trong pool với ưu tiên:
+  // 1) Không overshoot quota nếu có thể
+  // 2) Nếu bắt buộc overshoot: chỉ cho user 100% còn budget, vẫn ưu tiên thiếu nhiều (pickBalanced)
+  // 3) Anchor (nếu có) được ưu tiên nếu nằm trong tập ứng viên hợp lệ
+  const pickWithOvershoot = (
+    pool: number[],
+    blockSize: number,
+    hardCapArr: number[],
+    budgetArr: number[],
+    anchor?: number
+  ) => {
+    if (!pool.length) return -1;
+
+    // 1. Ưu tiên các user không cần overshoot
+    const noOver = pool.filter(
+      (i) => assignedCount[i] + blockSize <= hardCapArr[i]
+    );
+    if (noOver.length) {
+      if (anchor !== undefined && noOver.includes(anchor)) return anchor;
+      return pickBalanced(noOver);
+    }
+
+    // 2. Không còn ai giữ được quota -> xem những user 100% còn budget overshoot
+    const over = pool.filter(
+      (i) => active[i].weightPct >= 100 && budgetArr[i] >= blockSize // chỉ 100% và còn budget
+    );
+    if (!over.length) return -1;
+
+    if (anchor !== undefined && over.includes(anchor)) return anchor;
+    return pickBalanced(over);
+  };
+
   // ======= NHÓM THEO (VOUCHER, EXPORT) =======
   type Group = {
     vKey: string;
@@ -492,9 +574,10 @@ function allocatePreferWarehousesTwoPhase(
     const out: number[] = [];
     for (const i of pool) {
       if (!underCap(i, blockSize)) continue;
+      if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
-      if (foreignExportSets[i].size + addKeys.size <= limitDistinct)
-        out.push(i);
+      const userLimit = getForeignLimitForUser(i, limitDistinct);
+      if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
     }
     return out;
   };
@@ -506,9 +589,10 @@ function allocatePreferWarehousesTwoPhase(
   ) => {
     const out: number[] = [];
     for (const i of pool) {
+      if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
-      if (foreignExportSets[i].size + addKeys.size <= limitDistinct)
-        out.push(i);
+      const userLimit = getForeignLimitForUser(i, limitDistinct);
+      if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
     }
     return out;
   };
@@ -535,6 +619,7 @@ function allocatePreferWarehousesTwoPhase(
       deficitLive[owner] -= blockSize;
       const addKeys = foreignNewKeysFor(owner, g.expKeys);
       addKeys.forEach((k) => foreignExportSets[owner].add(k));
+      registerExportUser(owner, g);
       continue;
     }
 
@@ -547,30 +632,32 @@ function allocatePreferWarehousesTwoPhase(
     );
     if (cand.length) {
       const anchor = exportOverflowOwner.get(g.eKey);
-      let pickIdx: number;
+      const pickIdx = pickWithOvershoot(
+        cand,
+        blockSize,
+        hardCap,
+        new Array(active.length).fill(0), // pha chính: không cho overshoot ở đây
+        anchor
+      );
 
-      if (anchor !== undefined && cand.includes(anchor)) {
-        // Ưu tiên xài lại anchor cho cùng mã nơi xuất
-        pickIdx = anchor;
-      } else {
-        pickIdx = pickBalanced(cand);
-        // Nếu đây là non-owner đầu tiên cho eKey này => set anchor
-        if (!g.owners.includes(pickIdx)) {
-          exportOverflowOwner.set(g.eKey, pickIdx);
-        }
+      const chosen = pickIdx === -1 ? cand[0] : pickIdx;
+
+      if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
+        exportOverflowOwner.set(g.eKey, chosen);
       }
 
       for (const rIdx of g.idxs) {
         assignments.push({
-          userCode: active[pickIdx].code,
-          userName: active[pickIdx].name,
+          userCode: active[chosen].code,
+          userName: active[chosen].name,
           taskIndex: rIdx,
         });
       }
-      assignedCount[pickIdx] += blockSize;
-      deficitLive[pickIdx] -= blockSize;
-      const addKeys = foreignNewKeysFor(pickIdx, g.expKeys);
-      addKeys.forEach((k) => foreignExportSets[pickIdx].add(k));
+      assignedCount[chosen] += blockSize;
+      deficitLive[chosen] -= blockSize;
+      const addKeys = foreignNewKeysFor(chosen, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+      registerExportUser(chosen, g);
       continue;
     }
 
@@ -611,6 +698,7 @@ function allocatePreferWarehousesTwoPhase(
       deficitLive[owner] -= blockSize;
       const addKeys = foreignNewKeysFor(owner, g.expKeys);
       addKeys.forEach((k) => foreignExportSets[owner].add(k));
+      registerExportUser(owner, g);
       continue;
     }
 
@@ -623,36 +711,25 @@ function allocatePreferWarehousesTwoPhase(
       )
     );
 
-    // Ưu tiên anchor (nếu có) trong pool
     const anchorL2 = exportOverflowOwner.get(g.eKey);
-    if (anchorL2 !== undefined && pool.includes(anchorL2)) {
-      pool = [anchorL2, ...pool.filter((i) => i !== anchorL2)];
-    }
 
-    let chosen = -1;
-    for (const i of pool) {
-      const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
-      if (needOver === 0) {
-        chosen = i;
-        break;
-      }
-      if (
-        active[i].weightPct >= 100 &&
-        canOverWith(overshootBudgetBase, i, blockSize)
-      ) {
-        chosen = i;
-        break;
-      }
-    }
+    let chosen = pickWithOvershoot(
+      pool,
+      blockSize,
+      hardCap,
+      overshootBudgetBase,
+      anchorL2
+    );
 
     if (chosen !== -1) {
       const needOver = Math.max(
         0,
         assignedCount[chosen] + blockSize - hardCap[chosen]
       );
-      if (needOver > 0) overshootBudgetBase[chosen] -= blockSize;
+      if (needOver > 0 && active[chosen].weightPct >= 100) {
+        overshootBudgetBase[chosen] -= blockSize;
+      }
 
-      // Nếu chosen là non-owner đầu tiên cho eKey này thì set anchor
       if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
         exportOverflowOwner.set(g.eKey, chosen);
       }
@@ -668,6 +745,7 @@ function allocatePreferWarehousesTwoPhase(
       deficitLive[chosen] -= blockSize;
       const addKeys = foreignNewKeysFor(chosen, g.expKeys);
       addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+      registerExportUser(chosen, g);
       continue;
     }
 
@@ -701,30 +779,29 @@ function allocatePreferWarehousesTwoPhase(
         deficitLive[owner] -= blockSize;
         const addKeys = foreignNewKeysFor(owner, g.expKeys);
         addKeys.forEach((k) => foreignExportSets[owner].add(k));
+        registerExportUser(owner, g);
         continue;
       }
 
       // E2: OWNER overshoot có kiểm soát (ưu tiên)
       pool = filterForeignOnly(g.owners, g, limitDistinct);
-      // KHÔNG dùng anchor ở đây vì vẫn là owner
-      let chosen = -1;
-      for (const i of pool) {
-        const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
-        if (needOver === 0) {
-          chosen = i;
-          break;
-        }
-        if (active[i].weightPct >= 100 && budget[i] >= blockSize) {
-          chosen = i;
-          break;
-        }
-      }
+
+      let chosen = pickWithOvershoot(
+        pool,
+        blockSize,
+        hardCap,
+        budget,
+        undefined
+      );
+
       if (chosen !== -1) {
         const needOver = Math.max(
           0,
           assignedCount[chosen] + blockSize - hardCap[chosen]
         );
-        if (needOver > 0) budget[chosen] -= blockSize;
+        if (needOver > 0 && active[chosen].weightPct >= 100) {
+          budget[chosen] -= blockSize;
+        }
 
         for (const rIdx of g.idxs) {
           assignments.push({
@@ -737,6 +814,7 @@ function allocatePreferWarehousesTwoPhase(
         deficitLive[chosen] -= blockSize;
         const addKeys = foreignNewKeysFor(chosen, g.expKeys);
         addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+        registerExportUser(chosen, g);
         continue;
       }
 
@@ -772,6 +850,7 @@ function allocatePreferWarehousesTwoPhase(
         deficitLive[pickIdx] -= blockSize;
         const addKeys = foreignNewKeysFor(pickIdx, g.expKeys);
         addKeys.forEach((k) => foreignExportSets[pickIdx].add(k));
+        registerExportUser(pickIdx, g);
         continue;
       }
 
@@ -783,29 +862,17 @@ function allocatePreferWarehousesTwoPhase(
       );
 
       const anchorE4 = exportOverflowOwner.get(g.eKey);
-      if (anchorE4 !== undefined && pool.includes(anchorE4)) {
-        pool = [anchorE4, ...pool.filter((i) => i !== anchorE4)];
-      }
 
-      chosen = -1;
-      for (const i of pool) {
-        const needOver = Math.max(0, assignedCount[i] + blockSize - hardCap[i]);
-        if (needOver === 0) {
-          chosen = i;
-          break;
-        }
-        if (active[i].weightPct >= 100 && budget[i] >= blockSize) {
-          chosen = i;
-          break;
-        }
-      }
+      chosen = pickWithOvershoot(pool, blockSize, hardCap, budget, anchorE4);
 
       if (chosen !== -1) {
         const needOver = Math.max(
           0,
           assignedCount[chosen] + blockSize - hardCap[chosen]
         );
-        if (needOver > 0) budget[chosen] -= blockSize;
+        if (needOver > 0 && active[chosen].weightPct >= 100) {
+          budget[chosen] -= blockSize;
+        }
 
         if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
           exportOverflowOwner.set(g.eKey, chosen);
@@ -822,6 +889,7 @@ function allocatePreferWarehousesTwoPhase(
         deficitLive[chosen] -= blockSize;
         const addKeys = foreignNewKeysFor(chosen, g.expKeys);
         addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+        registerExportUser(chosen, g);
       } else {
         notDone.push(g);
       }
@@ -840,14 +908,23 @@ function allocatePreferWarehousesTwoPhase(
       const blockSize = g.idxs.length;
 
       // ownerFirst: ưu tiên chủ kho trước, rồi mới đến non-owner
-      const ownerFirst = [
+      let candidates = [
         ...g.owners,
         ...[...Array(active.length).keys()].filter(
           (i) => !g.owners.includes(i)
         ),
-      ];
+      ].filter((i) => canUseExportForUser(i, g)); // vẫn cố giữ rule 2-user-per-export
 
-      const candidates = ownerFirst.slice();
+      // Nếu vì rule 2-user-per-export mà không còn ai → buông rule này để tránh deadlock
+      if (!candidates.length) {
+        candidates = [
+          ...g.owners,
+          ...[...Array(active.length).keys()].filter(
+            (i) => !g.owners.includes(i)
+          ),
+        ];
+      }
+
       const scored = candidates.map((i) => ({
         i,
         deficit: deficitLive[i],
@@ -898,6 +975,7 @@ function allocatePreferWarehousesTwoPhase(
       deficitLive[chosen] -= blockSize;
       const addKeys = foreignNewKeysFor(chosen, g.expKeys);
       addKeys.forEach((k) => foreignExportSets[chosen].add(k));
+      registerExportUser(chosen, g);
     }
   }
 
