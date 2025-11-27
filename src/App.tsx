@@ -436,7 +436,7 @@ function allocatePreferWarehousesTwoPhase(
   // NEW: per-user limit mã ngoại (đã chỉnh)
   // - User <100%: luôn max = FOREIGN_LIMIT_BASE (2 mã ngoại)
   // - User 100%: nới limit dựa trên mức thiếu so với quota (hardCap)
-  const getForeignLimitForUser = (iUser: number, _baseLimit: number) => {
+  const getForeignLimitForUser = (iUser: number) => {
     const u = active[iUser];
 
     // Nhóm 50% / <100%: luôn giữ limit cơ bản
@@ -565,33 +565,24 @@ function allocatePreferWarehousesTwoPhase(
   );
 
   // ===== các filter dùng trong nhiều pha =====
-  const filterCapAndForeign = (
-    pool: number[],
-    g: Group,
-    blockSize: number,
-    limitDistinct: number
-  ) => {
+  const filterCapAndForeign = (pool: number[], g: Group, blockSize: number) => {
     const out: number[] = [];
     for (const i of pool) {
       if (!underCap(i, blockSize)) continue;
       if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
-      const userLimit = getForeignLimitForUser(i, limitDistinct);
+      const userLimit = getForeignLimitForUser(i);
       if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
     }
     return out;
   };
 
-  const filterForeignOnly = (
-    pool: number[],
-    g: Group,
-    limitDistinct: number
-  ) => {
+  const filterForeignOnly = (pool: number[], g: Group) => {
     const out: number[] = [];
     for (const i of pool) {
       if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
-      const userLimit = getForeignLimitForUser(i, limitDistinct);
+      const userLimit = getForeignLimitForUser(i);
       if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
     }
     return out;
@@ -605,7 +596,7 @@ function allocatePreferWarehousesTwoPhase(
     const allIdx = [...Array(active.length).keys()];
 
     // A1: OWNER underCap + foreign<=2
-    let cand = filterCapAndForeign(g.owners, g, blockSize, FOREIGN_LIMIT_BASE);
+    let cand = filterCapAndForeign(g.owners, g, blockSize);
     if (cand.length) {
       const owner = pickBalanced(cand);
       for (const rIdx of g.idxs) {
@@ -627,8 +618,7 @@ function allocatePreferWarehousesTwoPhase(
     cand = filterCapAndForeign(
       allIdx.filter((i) => !g.owners.includes(i)),
       g,
-      blockSize,
-      FOREIGN_LIMIT_BASE
+      blockSize
     );
     if (cand.length) {
       const anchor = exportOverflowOwner.get(g.eKey);
@@ -668,9 +658,6 @@ function allocatePreferWarehousesTwoPhase(
   // ===== LEFTOVERS (limit=2) – overshoot có kiểm soát: 100% có thể overshoot 1 block tổng
   const overshootBudgetBase = active.map((u) => (u.weightPct >= 100 ? 1 : 0));
 
-  const canOverWith = (budgetArr: number[], iUser: number, blockSize: number) =>
-    budgetArr[iUser] >= blockSize;
-
   const weightSortedIdx = [...Array(active.length).keys()].sort(
     (i, j) =>
       active[j].weightPct - active[i].weightPct ||
@@ -684,7 +671,7 @@ function allocatePreferWarehousesTwoPhase(
     const blockSize = g.idxs.length;
 
     // L1: OWNER underCap (limit=2) — thử lại lần nữa
-    let pool = filterCapAndForeign(g.owners, g, blockSize, FOREIGN_LIMIT_BASE);
+    let pool = filterCapAndForeign(g.owners, g, blockSize);
     if (pool.length) {
       const owner = pickBalanced(pool);
       for (const rIdx of g.idxs) {
@@ -703,17 +690,16 @@ function allocatePreferWarehousesTwoPhase(
     }
 
     // L2: OWNER overshoot có kiểm soát (limit=2) + non-owner overshoot
-    pool = filterForeignOnly(g.owners, g, FOREIGN_LIMIT_BASE).concat(
+    pool = filterForeignOnly(g.owners, g).concat(
       filterForeignOnly(
         weightSortedIdx.filter((i) => !g.owners.includes(i)),
-        g,
-        FOREIGN_LIMIT_BASE
+        g
       )
     );
 
     const anchorL2 = exportOverflowOwner.get(g.eKey);
 
-    let chosen = pickWithOvershoot(
+    const chosen = pickWithOvershoot(
       pool,
       blockSize,
       hardCap,
@@ -755,7 +741,7 @@ function allocatePreferWarehousesTwoPhase(
 
   // ===== Escalation: thử limit=3 rồi 4 (vẫn ưu tiên OWNER trước)
   // Không tăng thêm ngân sách overshoot cho nhóm 100% (khóa ở 1 block)
-  const escalateAssign = (groupsIn: Group[], limitDistinct: number) => {
+  const escalateAssign = (groupsIn: Group[]) => {
     if (!groupsIn.length) return [] as Group[];
     const budget = overshootBudgetBase.slice(); // KHÔNG cộng thêm
 
@@ -765,7 +751,7 @@ function allocatePreferWarehousesTwoPhase(
       const blockSize = g.idxs.length;
 
       // E1: OWNER underCap + foreign<=limit
-      let pool = filterCapAndForeign(g.owners, g, blockSize, limitDistinct);
+      let pool = filterCapAndForeign(g.owners, g, blockSize);
       if (pool.length) {
         const owner = pickBalanced(pool);
         for (const rIdx of g.idxs) {
@@ -784,7 +770,7 @@ function allocatePreferWarehousesTwoPhase(
       }
 
       // E2: OWNER overshoot có kiểm soát (ưu tiên)
-      pool = filterForeignOnly(g.owners, g, limitDistinct);
+      pool = filterForeignOnly(g.owners, g);
 
       let chosen = pickWithOvershoot(
         pool,
@@ -822,8 +808,7 @@ function allocatePreferWarehousesTwoPhase(
       pool = filterCapAndForeign(
         [...Array(active.length).keys()].filter((i) => !g.owners.includes(i)),
         g,
-        blockSize,
-        limitDistinct
+        blockSize
       );
 
       if (pool.length) {
@@ -857,8 +842,7 @@ function allocatePreferWarehousesTwoPhase(
       // E4: non-owner overshoot có kiểm soát (>=100% + còn budget)
       pool = filterForeignOnly(
         [...Array(active.length).keys()].filter((i) => !g.owners.includes(i)),
-        g,
-        limitDistinct
+        g
       );
 
       const anchorE4 = exportOverflowOwner.get(g.eKey);
@@ -899,8 +883,8 @@ function allocatePreferWarehousesTwoPhase(
   };
 
   let pending = stillLeft;
-  pending = escalateAssign(pending, 3);
-  pending = escalateAssign(pending, 4);
+  pending = escalateAssign(pending);
+  pending = escalateAssign(pending);
 
   // ===== L5: Force-assign — ưu tiên OWNER nhưng chọn cân bằng hơn
   if (pending.length) {
