@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import {
   Layout,
   Typography,
@@ -27,7 +27,9 @@ import {
   Empty,
   Popover,
   Select,
+  Tour,
 } from "antd";
+import type { TourProps } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import {
   UploadOutlined,
@@ -44,6 +46,8 @@ import {
   ThunderboltOutlined,
   UserOutlined,
   SettingOutlined,
+  QuestionCircleOutlined,
+  HolderOutlined,
 } from "@ant-design/icons";
 import * as XLSX from "xlsx";
 import {
@@ -68,7 +72,6 @@ import type {
   TaskRow,
   User,
 } from "./type";
-import { HolderOutlined } from "@ant-design/icons";
 import { CSS } from "@dnd-kit/utilities";
 import {
   DndContext,
@@ -84,18 +87,10 @@ import {
   verticalListSortingStrategy,
   arrayMove,
 } from "@dnd-kit/sortable";
+import StatsView from "./StatsView";
 
 const { Header, Content } = Layout;
 const { Title, Text } = Typography;
-
-import { Tour } from "antd";
-import type { TourProps } from "antd";
-
-import { QuestionCircleOutlined } from "@ant-design/icons";
-
-import { useRef } from "react";
-
-import StatsView from "./StatsView";
 
 // ==================== UTILITIES ====================
 const stripDiacritics = (s: string) =>
@@ -350,6 +345,14 @@ function allocatePreferWarehousesTwoPhase(
 
   const hardCap = quota.slice();
 
+  // ===== NEW: targetCap – trần mềm để tránh vượt quota quá xa =====
+  // Ví dụ: target = quota + max(3, 25% quota)
+  const targetCap = hardCap.map((q) => {
+    if (q <= 0) return 0;
+    const extra = Math.max(3, Math.ceil(q * 0.25)); // có thể chỉnh lại tuỳ bạn
+    return q + extra;
+  });
+
   // ===== GIỮ: giới hạn ngoại kho gốc =====
   const FOREIGN_LIMIT_BASE = 2;
 
@@ -362,12 +365,11 @@ function allocatePreferWarehousesTwoPhase(
     () => new Set<string>()
   );
 
-  // Rule: mỗi mã nơi xuất chỉ tối đa 2 user "dính" vào
-  const exportUserSet = new Map<string, Set<number>>();
+  // Rule: mỗi mã nơi xuất chỉ tối đa N user "dính" vào
+  const MAX_USERS_PER_EXPORT = 4; // <-- muốn 3 thì đổi thành 3
 
-  // Anchor non-owner cho từng mã nơi xuất
-  // eKey -> index user trong mảng active
-  const exportOverflowOwner = new Map<string, number>();
+  // eKey -> tập index user đang "dính" vào mã nơi xuất đó
+  const exportUserSet = new Map<string, Set<number>>();
 
   // ===== Helpers =====
   const normCodeLike = (v: unknown) => {
@@ -433,9 +435,7 @@ function allocatePreferWarehousesTwoPhase(
     return best;
   };
 
-  // NEW: per-user limit mã ngoại (đã chỉnh)
-  // - User <100%: luôn max = FOREIGN_LIMIT_BASE (2 mã ngoại)
-  // - User 100%: nới limit dựa trên mức thiếu so với quota (hardCap)
+  // NEW: per-user limit mã ngoại
   const getForeignLimitForUser = (iUser: number) => {
     const u = active[iUser];
 
@@ -452,23 +452,27 @@ function allocatePreferWarehousesTwoPhase(
     if (deficit <= 0) return FOREIGN_LIMIT_BASE;
 
     // Thiếu càng nhiều thì cho phép thêm càng nhiều mã ngoại kho
-    // (các ngưỡng này có thể chỉnh theo thực tế)
-    if (deficit >= 12) return FOREIGN_LIMIT_BASE + 4; // ví dụ: 2 + 4 = 6 mã ngoại
+    if (deficit >= 12) return FOREIGN_LIMIT_BASE + 4; // 2 + 4 = 6 mã ngoại
     if (deficit >= 8) return FOREIGN_LIMIT_BASE + 3; // 2 + 3 = 5 mã ngoại
     if (deficit >= 4) return FOREIGN_LIMIT_BASE + 2; // 2 + 2 = 4 mã ngoại
     return FOREIGN_LIMIT_BASE + 1; // 2 + 1 = 3 mã ngoại
   };
 
-  // NEW: kiểm tra rule 2-user-per-export (không mutate)
+  // Kiểm tra rule giới hạn số user / export (không mutate)
   const canUseExportForUser = (iUser: number, g: Group) => {
     const eKey = g.eKey;
     if (!eKey || eKey === "__NO_EXPORT__") return true;
+
     const set = exportUserSet.get(eKey);
     if (!set) return true;
-    return set.has(iUser) || set.size < 2;
+
+    // Cho phép:
+    // - user đã "dính" vào mã đó tiếp tục nhận
+    // - hoặc thêm user mới nếu chưa vượt MAX_USERS_PER_EXPORT
+    return set.has(iUser) || set.size < MAX_USERS_PER_EXPORT;
   };
 
-  // NEW: khi đã CHỌN user cho group → ghi nhận user đó vào exportUserSet
+  // Khi đã CHỌN user cho group → ghi nhận user đó vào exportUserSet
   const registerExportUser = (iUser: number, g: Group) => {
     const eKey = g.eKey;
     if (!eKey || eKey === "__NO_EXPORT__") return;
@@ -482,33 +486,34 @@ function allocatePreferWarehousesTwoPhase(
 
   // NEW: chọn user trong pool với ưu tiên:
   // 1) Không overshoot quota nếu có thể
-  // 2) Nếu bắt buộc overshoot: chỉ cho user 100% còn budget, vẫn ưu tiên thiếu nhiều (pickBalanced)
-  // 3) Anchor (nếu có) được ưu tiên nếu nằm trong tập ứng viên hợp lệ
+  // 2) Nếu bắt buộc overshoot: chỉ cho user 100% còn budget + CHƯA vượt targetCap
   const pickWithOvershoot = (
     pool: number[],
     blockSize: number,
     hardCapArr: number[],
     budgetArr: number[],
-    anchor?: number
+    targetCapArr: number[]
   ) => {
     if (!pool.length) return -1;
 
-    // 1. Ưu tiên các user không cần overshoot
+    // 1. Ưu tiên các user không cần overshoot (<= hardCap)
     const noOver = pool.filter(
       (i) => assignedCount[i] + blockSize <= hardCapArr[i]
     );
     if (noOver.length) {
-      if (anchor !== undefined && noOver.includes(anchor)) return anchor;
       return pickBalanced(noOver);
     }
 
-    // 2. Không còn ai giữ được quota -> xem những user 100% còn budget overshoot
+    // 2. Không còn ai giữ được quota -> xem những user 100% còn budget
+    //    VÀ vẫn chưa vượt targetCap
     const over = pool.filter(
-      (i) => active[i].weightPct >= 100 && budgetArr[i] >= blockSize // chỉ 100% và còn budget
+      (i) =>
+        active[i].weightPct >= 100 &&
+        budgetArr[i] >= blockSize &&
+        assignedCount[i] + blockSize <= targetCapArr[i]
     );
     if (!over.length) return -1;
 
-    if (anchor !== undefined && over.includes(anchor)) return anchor;
     return pickBalanced(over);
   };
 
@@ -569,7 +574,7 @@ function allocatePreferWarehousesTwoPhase(
     const out: number[] = [];
     for (const i of pool) {
       if (!underCap(i, blockSize)) continue;
-      if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
+      if (!canUseExportForUser(i, g)) continue; // giữ rule giới hạn số user / export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
       const userLimit = getForeignLimitForUser(i);
       if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
@@ -580,7 +585,7 @@ function allocatePreferWarehousesTwoPhase(
   const filterForeignOnly = (pool: number[], g: Group) => {
     const out: number[] = [];
     for (const i of pool) {
-      if (!canUseExportForUser(i, g)) continue; // giữ rule 2-user-per-export
+      if (!canUseExportForUser(i, g)) continue; // giữ rule giới hạn số user / export
       const addKeys = foreignNewKeysFor(i, g.expKeys);
       const userLimit = getForeignLimitForUser(i);
       if (foreignExportSets[i].size + addKeys.size <= userLimit) out.push(i);
@@ -588,14 +593,14 @@ function allocatePreferWarehousesTwoPhase(
     return out;
   };
 
-  // ===== PHA CHÍNH: limit=2, ưu tiên OWNER tuyệt đối trước khi xét non-owner =====
+  // ===== PHA CHÍNH: ưu tiên OWNER tuyệt đối trước khi xét non-owner =====
   const leftovers: Group[] = [];
 
   for (const g of groups) {
     const blockSize = g.idxs.length;
     const allIdx = [...Array(active.length).keys()];
 
-    // A1: OWNER underCap + foreign<=2
+    // A1: OWNER underCap + foreign<=limit
     let cand = filterCapAndForeign(g.owners, g, blockSize);
     if (cand.length) {
       const owner = pickBalanced(cand);
@@ -614,40 +619,35 @@ function allocatePreferWarehousesTwoPhase(
       continue;
     }
 
-    // A2: KHÔNG có owner còn cap → non-owner underCap + foreign<=2
+    // A2: KHÔNG có owner còn cap → non-owner underCap + foreign<=limit
     cand = filterCapAndForeign(
       allIdx.filter((i) => !g.owners.includes(i)),
       g,
       blockSize
     );
     if (cand.length) {
-      const anchor = exportOverflowOwner.get(g.eKey);
-      const pickIdx = pickWithOvershoot(
+      const chosen = pickWithOvershoot(
         cand,
         blockSize,
         hardCap,
         new Array(active.length).fill(0), // pha chính: không cho overshoot ở đây
-        anchor
+        targetCap
       );
 
-      const chosen = pickIdx === -1 ? cand[0] : pickIdx;
-
-      if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
-        exportOverflowOwner.set(g.eKey, chosen);
-      }
+      const finalIdx = chosen === -1 ? cand[0] : chosen;
 
       for (const rIdx of g.idxs) {
         assignments.push({
-          userCode: active[chosen].code,
-          userName: active[chosen].name,
+          userCode: active[finalIdx].code,
+          userName: active[finalIdx].name,
           taskIndex: rIdx,
         });
       }
-      assignedCount[chosen] += blockSize;
-      deficitLive[chosen] -= blockSize;
-      const addKeys = foreignNewKeysFor(chosen, g.expKeys);
-      addKeys.forEach((k) => foreignExportSets[chosen].add(k));
-      registerExportUser(chosen, g);
+      assignedCount[finalIdx] += blockSize;
+      deficitLive[finalIdx] -= blockSize;
+      const addKeys = foreignNewKeysFor(finalIdx, g.expKeys);
+      addKeys.forEach((k) => foreignExportSets[finalIdx].add(k));
+      registerExportUser(finalIdx, g);
       continue;
     }
 
@@ -655,7 +655,7 @@ function allocatePreferWarehousesTwoPhase(
     leftovers.push(g);
   }
 
-  // ===== LEFTOVERS (limit=2) – overshoot có kiểm soát: 100% có thể overshoot 1 block tổng
+  // ===== LEFTOVERS – overshoot có kiểm soát: 100% có thể overshoot 1 block tổng (nhưng ≤ targetCap) =====
   const overshootBudgetBase = active.map((u) => (u.weightPct >= 100 ? 1 : 0));
 
   const weightSortedIdx = [...Array(active.length).keys()].sort(
@@ -670,7 +670,7 @@ function allocatePreferWarehousesTwoPhase(
   for (const g of leftovers) {
     const blockSize = g.idxs.length;
 
-    // L1: OWNER underCap (limit=2) — thử lại lần nữa
+    // L1: OWNER underCap — thử lại lần nữa
     let pool = filterCapAndForeign(g.owners, g, blockSize);
     if (pool.length) {
       const owner = pickBalanced(pool);
@@ -689,7 +689,7 @@ function allocatePreferWarehousesTwoPhase(
       continue;
     }
 
-    // L2: OWNER overshoot có kiểm soát (limit=2) + non-owner overshoot
+    // L2: OWNER + non-owner overshoot có kiểm soát (respect targetCap)
     pool = filterForeignOnly(g.owners, g).concat(
       filterForeignOnly(
         weightSortedIdx.filter((i) => !g.owners.includes(i)),
@@ -697,14 +697,12 @@ function allocatePreferWarehousesTwoPhase(
       )
     );
 
-    const anchorL2 = exportOverflowOwner.get(g.eKey);
-
     const chosen = pickWithOvershoot(
       pool,
       blockSize,
       hardCap,
       overshootBudgetBase,
-      anchorL2
+      targetCap
     );
 
     if (chosen !== -1) {
@@ -714,10 +712,6 @@ function allocatePreferWarehousesTwoPhase(
       );
       if (needOver > 0 && active[chosen].weightPct >= 100) {
         overshootBudgetBase[chosen] -= blockSize;
-      }
-
-      if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
-        exportOverflowOwner.set(g.eKey, chosen);
       }
 
       for (const rIdx of g.idxs) {
@@ -735,12 +729,11 @@ function allocatePreferWarehousesTwoPhase(
       continue;
     }
 
-    // L3: không xong ở limit=2 -> để escalation
+    // L3: không xong -> để escalation
     stillLeft.push(g);
   }
 
-  // ===== Escalation: thử limit=3 rồi 4 (vẫn ưu tiên OWNER trước)
-  // Không tăng thêm ngân sách overshoot cho nhóm 100% (khóa ở 1 block)
+  // ===== Escalation: vẫn ưu tiên OWNER, vẫn bị trần bởi targetCap trong overshoot =====
   const escalateAssign = (groupsIn: Group[]) => {
     if (!groupsIn.length) return [] as Group[];
     const budget = overshootBudgetBase.slice(); // KHÔNG cộng thêm
@@ -769,7 +762,7 @@ function allocatePreferWarehousesTwoPhase(
         continue;
       }
 
-      // E2: OWNER overshoot có kiểm soát (ưu tiên)
+      // E2: OWNER overshoot có kiểm soát (ưu tiên, ≤ targetCap)
       pool = filterForeignOnly(g.owners, g);
 
       let chosen = pickWithOvershoot(
@@ -777,7 +770,7 @@ function allocatePreferWarehousesTwoPhase(
         blockSize,
         hardCap,
         budget,
-        undefined
+        targetCap
       );
 
       if (chosen !== -1) {
@@ -812,17 +805,7 @@ function allocatePreferWarehousesTwoPhase(
       );
 
       if (pool.length) {
-        const anchor = exportOverflowOwner.get(g.eKey);
-        let pickIdx: number;
-
-        if (anchor !== undefined && pool.includes(anchor)) {
-          pickIdx = anchor;
-        } else {
-          pickIdx = pickBalanced(pool);
-          if (!g.owners.includes(pickIdx)) {
-            exportOverflowOwner.set(g.eKey, pickIdx);
-          }
-        }
+        const pickIdx = pickBalanced(pool);
 
         for (const rIdx of g.idxs) {
           assignments.push({
@@ -839,15 +822,13 @@ function allocatePreferWarehousesTwoPhase(
         continue;
       }
 
-      // E4: non-owner overshoot có kiểm soát (>=100% + còn budget)
+      // E4: non-owner overshoot có kiểm soát (>=100% + còn budget, ≤ targetCap)
       pool = filterForeignOnly(
         [...Array(active.length).keys()].filter((i) => !g.owners.includes(i)),
         g
       );
 
-      const anchorE4 = exportOverflowOwner.get(g.eKey);
-
-      chosen = pickWithOvershoot(pool, blockSize, hardCap, budget, anchorE4);
+      chosen = pickWithOvershoot(pool, blockSize, hardCap, budget, targetCap);
 
       if (chosen !== -1) {
         const needOver = Math.max(
@@ -856,10 +837,6 @@ function allocatePreferWarehousesTwoPhase(
         );
         if (needOver > 0 && active[chosen].weightPct >= 100) {
           budget[chosen] -= blockSize;
-        }
-
-        if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
-          exportOverflowOwner.set(g.eKey, chosen);
         }
 
         for (const rIdx of g.idxs) {
@@ -886,7 +863,7 @@ function allocatePreferWarehousesTwoPhase(
   pending = escalateAssign(pending);
   pending = escalateAssign(pending);
 
-  // ===== L5: Force-assign — ưu tiên OWNER nhưng chọn cân bằng hơn
+  // ===== L5: Force-assign — ưu tiên OWNER, ưu tiên user chưa chạm targetCap =====
   if (pending.length) {
     for (const g of pending) {
       const blockSize = g.idxs.length;
@@ -897,9 +874,9 @@ function allocatePreferWarehousesTwoPhase(
         ...[...Array(active.length).keys()].filter(
           (i) => !g.owners.includes(i)
         ),
-      ].filter((i) => canUseExportForUser(i, g)); // vẫn cố giữ rule 2-user-per-export
+      ].filter((i) => canUseExportForUser(i, g)); // vẫn cố giữ rule giới hạn user/export
 
-      // Nếu vì rule 2-user-per-export mà không còn ai → buông rule này để tránh deadlock
+      // Nếu vì rule giới hạn user/export mà không còn ai → buông rule này để tránh deadlock
       if (!candidates.length) {
         candidates = [
           ...g.owners,
@@ -914,6 +891,8 @@ function allocatePreferWarehousesTwoPhase(
         deficit: deficitLive[i],
         util: assignedCount[i] / Math.max(1, hardCap[i]),
         isHundred: active[i].weightPct >= 100,
+        overTarget: assignedCount[i] >= targetCap[i],
+        targetDef: targetCap[i] - assignedCount[i],
       }));
 
       // 1) Thử người <100% còn underCap
@@ -921,32 +900,27 @@ function allocatePreferWarehousesTwoPhase(
         (s) => !s.isHundred && assignedCount[s.i] + blockSize <= hardCap[s.i]
       );
 
-      const anchorL5 = exportOverflowOwner.get(g.eKey);
-
-      let chosen: number;
-
-      if (anchorL5 !== undefined && candidates.includes(anchorL5)) {
-        // Force ưu tiên anchor nếu còn nằm trong candidates
-        chosen = anchorL5;
-      } else {
-        if (!pool.length) {
-          // 2) Cho 100% gánh nếu bắt buộc, ưu tiên thiếu nhiều & util thấp
-          pool = scored;
-        }
-
-        pool.sort(
-          (a, b) =>
-            b.deficit - a.deficit ||
-            a.util - b.util ||
-            orderRank[a.i] - orderRank[b.i]
-        );
-
-        chosen = pool[0]?.i ?? candidates[0];
-
-        if (!g.owners.includes(chosen) && !exportOverflowOwner.has(g.eKey)) {
-          exportOverflowOwner.set(g.eKey, chosen);
-        }
+      if (!pool.length) {
+        // 2) Không có ai <100% phù hợp → cho 100% gánh nếu bắt buộc
+        //    nhưng ưu tiên người CHƯA vượt targetCap, thiếu nhiều và util thấp
+        pool = scored;
       }
+
+      pool.sort(
+        (a, b) =>
+          // Ưu tiên chưa vượt targetCap
+          (a.overTarget === b.overTarget ? 0 : a.overTarget ? 1 : -1) ||
+          // Sau đó: ai thiếu quota (deficitLive) nhiều hơn
+          b.deficit - a.deficit ||
+          // Rồi tới: ai còn xa target hơn
+          b.targetDef - a.targetDef ||
+          // Rồi tới: util thấp hơn
+          a.util - b.util ||
+          // Cuối cùng: giữ ổn định theo orderRank
+          orderRank[a.i] - orderRank[b.i]
+      );
+
+      const chosen = pool[0]?.i ?? candidates[0];
 
       for (const rIdx of g.idxs) {
         assignments.push({
